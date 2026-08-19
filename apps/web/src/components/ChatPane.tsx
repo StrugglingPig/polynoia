@@ -25,15 +25,18 @@ import { ConvWebSocket } from "../lib/ws";
 import {
 	type AgentPhase,
 	type AgentStatusValue,
+	type FailedComposerDraft,
 	phaseLabel,
 	selectAgentStatuses,
 	selectMessages,
 	useStore,
 } from "../store";
-import { AskFormsPanel } from "./AskFormsPanel";
+import { AskFormsPanel, askResumeMessageId } from "./AskFormsPanel";
 import { Composer } from "./Composer";
 import { FloatingProjectAccessBar } from "./FloatingProjectAccessBar";
 import { MessageView, isRenderableMessagePayload } from "./MessageView";
+import { ChatMessagesSkeleton } from "./Skeleton";
+import { sendOptimisticUserMessage } from "./optimisticMessageDelivery";
 import { DiscussionPart } from "./parts/DiscussionPart";
 import { MergedReasoning } from "./parts/MergedReasoning";
 import { TasksBurstPart } from "./parts/TasksBurstPart";
@@ -47,54 +50,342 @@ type Props = {
 	title: string;
 };
 
+type CurrentConversationSocket = Pick<
+	ConvWebSocket,
+	"convId" | "sendUserMessage"
+>;
+
+export type ChatSendAttempt = {
+	convId: string;
+	text: string;
+	inReplyTo: string | null;
+	ts: number;
+};
+
+/** Claim the 500ms duplicate guard with the full send identity. Conversation
+ * switches and different reply targets are independent legitimate sends. */
+export function claimChatSendAttempt(
+	ref: { current: ChatSendAttempt | null },
+	{
+		convId,
+		text,
+		inReplyTo,
+		now = Date.now(),
+	}: {
+		convId: string;
+		text: string;
+		inReplyTo?: string;
+		now?: number;
+	},
+): ChatSendAttempt | null {
+	const replyTarget = inReplyTo ?? null;
+	const last = ref.current;
+	if (
+		last &&
+		last.convId === convId &&
+		last.text === text &&
+		last.inReplyTo === replyTarget &&
+		now - last.ts < 500
+	) {
+		return null;
+	}
+	const attempt = { convId, text, inReplyTo: replyTarget, ts: now };
+	ref.current = attempt;
+	return attempt;
+}
+
+/** Actual Composer call point, exported so delivery/UI lifecycle stays testable. */
+export function sendChatPaneComposerMessage({
+	convId,
+	text,
+	members,
+	inReplyTo,
+	replyingTo,
+	recoveryDraft,
+	getWs,
+	lastSentRef,
+	attempt,
+}: {
+	convId: string;
+	text: string;
+	members: string[];
+	inReplyTo?: string;
+	replyingTo?: {
+		msgId: string;
+		snippet: string;
+		senderLabel: string;
+	};
+	recoveryDraft?: FailedComposerDraft;
+	getWs: () => CurrentConversationSocket | null;
+	lastSentRef?: { current: ChatSendAttempt | null };
+	attempt?: ChatSendAttempt;
+}): string | null {
+	const ownedAttempt = attempt ?? lastSentRef?.current ?? null;
+	const recoveryId = recoveryDraft?.recoveryId ?? null;
+	if (recoveryId) {
+		useStore.getState().updateFailedComposerDraft(convId, recoveryId, {
+			text,
+			replyingTo,
+			inFlight: true,
+		});
+	}
+	return sendOptimisticUserMessage({
+		appendUserMessage: useStore.getState().appendUserMessage,
+		ws: getWs(),
+		convId,
+		localText: text,
+		members,
+		inReplyTo,
+		onFailure: ({ msgId }) => {
+			if (lastSentRef && lastSentRef.current === ownedAttempt) {
+				lastSentRef.current = null;
+			}
+			// Composer has already cleared the submitted text by the time an async
+			// receipt fails. Queue it for this conversation, but let newer typing win.
+			if (recoveryId) {
+				const recovered = useStore
+					.getState()
+					.updateFailedComposerDraft(convId, recoveryId, {
+						text,
+						replyingTo,
+						inFlight: false,
+					});
+				if (recovered) return;
+			}
+			useStore.getState().enqueueFailedComposerDraft({
+				convId,
+				text,
+				restore: "if-empty",
+				replyingTo,
+				recoveryId: recoveryId ?? msgId ?? undefined,
+			});
+		},
+		onSuccess: () => {
+			if (recoveryId) {
+				useStore.getState().consumeFailedComposerDraft(convId, recoveryId);
+			}
+		},
+	});
+}
+
+export function clearChatPaneSocketIfCurrent<T>(
+	ref: { current: T | null },
+	closing: T,
+): void {
+	if (ref.current === closing) ref.current = null;
+}
+
+/** Regenerate sends happen after one or more awaited API calls. Resolve and
+ * validate the socket at that final call point so conversation A can never be
+ * dispatched through a newly-mounted conversation B socket. */
+export function sendRegenerationOnCurrentSocket({
+	convId,
+	text,
+	members,
+	getWs,
+	options,
+}: {
+	convId: string;
+	text: string;
+	members: string[];
+	getWs: () => CurrentConversationSocket | null;
+	options: {
+		regenerate?: boolean;
+		regenerateMsgId?: string;
+		regenerateSenderId?: string;
+	};
+}): boolean {
+	const currentWs = getWs();
+	if (!currentWs || currentWs.convId !== convId) return false;
+	try {
+		currentWs.sendUserMessage(text, members, undefined, undefined, options);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+/** Apply a full payload update delivered over WS. If the target row has not
+ * hydrated yet, invalidate older page requests and immediately refetch instead
+ * of letting their stale payload land after this event. */
+export function applyIncomingMessagePayloadUpdate({
+	convId,
+	msgId,
+	payload,
+	refresh,
+}: {
+	convId: string;
+	msgId: string;
+	payload: Message["payload"];
+	refresh: () => Promise<unknown> | unknown;
+}): boolean {
+	const current = useStore.getState().convs.get(convId)?.msgById.get(msgId);
+	if (!current) {
+		useStore.getState().invalidateMessageHydrations(convId);
+		void Promise.resolve(refresh()).catch(() => undefined);
+		return false;
+	}
+	useStore.getState().markMessagesMutated(convId, [msgId]);
+	useStore.setState((state) => {
+		const conv = state.convs.get(convId);
+		const message = conv?.msgById.get(msgId);
+		if (!conv || !message) return {};
+		const msgById = new Map(conv.msgById);
+		msgById.set(msgId, { ...message, payload });
+		const convs = new Map(state.convs);
+		convs.set(convId, { ...conv, msgById });
+		return { convs };
+	});
+	return true;
+}
+
+/** Server-authoritative deletion invalidates older pages; immediately replace
+ * them so an initial load cannot remain forever in the skeleton state. */
+export function applyIncomingMessageRemoval({
+	convId,
+	msgId,
+	refresh,
+}: {
+	convId: string;
+	msgId: string;
+	refresh: () => Promise<unknown> | unknown;
+}): void {
+	useStore.getState().removeMessageAuthoritatively(convId, msgId);
+	void Promise.resolve(refresh()).catch(() => undefined);
+}
+
+type LatestMessagesResult = Awaited<ReturnType<typeof api.convMessages>>;
+
+/** Capture before starting the GET, then apply its response with that token. */
+export async function hydrateLatestMessagesFromRequest(
+	convId: string,
+	fetchMessages: () => Promise<LatestMessagesResult>,
+): Promise<void> {
+	const store = useStore.getState();
+	const request = store.captureMessageHydration(convId);
+	const { messages, has_more } = await fetchMessages();
+	useStore.getState().hydrateMessages(convId, messages, {
+		mode: "replace",
+		hasMore: has_more,
+		request,
+	});
+}
+
+/** Older-page loads carry the same destructive epoch as newest-page loads so
+ * a clear/rewind that lands while the GET is pending cannot resurrect history. */
+export async function hydrateOlderMessagesFromRequest(
+	convId: string,
+	fetchMessages: () => Promise<LatestMessagesResult>,
+): Promise<void> {
+	const store = useStore.getState();
+	const request = store.captureMessageHydration(convId);
+	const { messages, has_more } = await fetchMessages();
+	useStore.getState().hydrateMessages(convId, messages, {
+		mode: "prepend",
+		hasMore: has_more,
+		request,
+	});
+}
+
+/** User rows explicitly replying to an ask card are rendered inside that card,
+ * including durable orphan resumes after the card has already been stamped. */
+export function computeAskAnswerSkip(
+	orderedMessages: readonly Message[],
+): Set<string> {
+	const out = new Set<string>();
+	const askIds = new Set<string>();
+	for (const message of orderedMessages) {
+		const payload = message.payload as { kind?: string };
+		if (payload?.kind === "ask-form") askIds.add(message.id);
+	}
+	for (const message of orderedMessages) {
+		if (
+			message.sender_id === "you" &&
+			message.in_reply_to &&
+			askIds.has(message.in_reply_to) &&
+			message.id === askResumeMessageId(message.in_reply_to)
+		) {
+			out.add(message.id);
+		}
+	}
+
+	// Backward compatibility for legacy answers created before reply targeting:
+	// only the immediate next non-system user row after an unanswered card.
+	for (let i = 0; i < orderedMessages.length; i += 1) {
+		const payload = orderedMessages[i].payload as {
+			kind?: string;
+			answer?: unknown;
+		};
+		if (payload?.kind !== "ask-form" || payload.answer != null) continue;
+		for (let j = i + 1; j < orderedMessages.length; j += 1) {
+			const next = orderedMessages[j];
+			if (next.sender_id === "system") continue;
+			if (next.sender_id === "you") out.add(next.id);
+			break;
+		}
+	}
+	return out;
+}
+
 function AgentExecutionPlaceholder({
 	agent,
 	agentId,
 	label,
 	mobile,
 	lang,
+	showAvatar = true,
 }: {
 	agent?: { id: string; name: string; initials: string; color: string };
 	agentId: string;
 	label: string;
 	mobile: boolean;
 	lang: Lang;
+	// When this placeholder continues the SAME agent's run (its message block is
+	// already above), suppress the avatar + name header so it groups under one
+	// avatar instead of showing a duplicate "执行中" header block.
+	showAvatar?: boolean;
 }) {
 	return (
 		<div
 			data-agent-placeholder={agentId}
 			className={`anim-fade-up group/msg flex transition-colors duration-200 hover:bg-[var(--color-surface-2)]/25 ${
 				mobile ? "px-2 gap-2" : "px-6 gap-3"
-			} pt-3 pb-1.5`}
+			} ${showAvatar ? "pt-3" : "pt-0.5"} pb-1.5`}
 			aria-live="polite"
 		>
 			<div className={`${mobile ? "w-7" : "w-8"} flex-shrink-0`}>
-				<button
-					type="button"
-					onClick={() => agent && useStore.getState().openAgentDetail(agent.id)}
-					className={`${mobile ? "w-7 h-7 text-[10.5px]" : "w-8 h-8 text-[11px]"} rounded-full grid place-items-center text-white font-medium shadow-sm ring-1 ring-[var(--color-line)] transition-all duration-200 group-hover/msg:scale-[1.04]`}
-					style={{ background: agent?.color ?? "var(--color-fg-3)" }}
-					title={`查看 ${agent?.name ?? "Agent"} 详情`}
-				>
-					{agent?.initials ?? "?"}
-				</button>
-			</div>
-			<div className="flex-1 min-w-0">
-				<div className="flex items-baseline gap-2 mb-1">
+				{showAvatar && (
 					<button
 						type="button"
 						onClick={() =>
 							agent && useStore.getState().openAgentDetail(agent.id)
 						}
-						className="font-display text-[14px] font-medium text-[var(--color-fg)] tracking-wide hover:text-[var(--color-accent)] hover:underline decoration-1 underline-offset-2 transition"
-						title={t("viewDetailsBrief", lang)}
+						className={`${mobile ? "w-7 h-7 text-[10.5px]" : "w-8 h-8 text-[11px]"} rounded-full grid place-items-center text-white font-medium shadow-sm ring-1 ring-[var(--color-line)] transition-all duration-200 group-hover/msg:scale-[1.04]`}
+						style={{ background: agent?.color ?? "var(--color-fg-3)" }}
+						title={`查看 ${agent?.name ?? "Agent"} 详情`}
 					>
-						{agent?.name ?? "Agent"}
+						{agent?.initials ?? "?"}
 					</button>
-					<span className="text-[10px] font-mono uppercase tracking-[0.14em] text-[var(--color-fg-4)]">
-						{t("executing", lang)}
-					</span>
-				</div>
+				)}
+			</div>
+			<div className="flex-1 min-w-0">
+				{showAvatar && (
+					<div className="flex items-baseline gap-2 mb-1">
+						<button
+							type="button"
+							onClick={() =>
+								agent && useStore.getState().openAgentDetail(agent.id)
+							}
+							className="font-display text-[14px] font-medium text-[var(--color-fg)] tracking-wide hover:text-[var(--color-accent)] hover:underline decoration-1 underline-offset-2 transition"
+							title={t("viewDetailsBrief", lang)}
+						>
+							{agent?.name ?? "Agent"}
+						</button>
+						<span className="text-[10px] font-mono uppercase tracking-[0.14em] text-[var(--color-fg-4)]">
+							{t("executing", lang)}
+						</span>
+					</div>
+				)}
 				<TypingPart payload={{ kind: "typing", note: label }} />
 			</div>
 		</div>
@@ -153,7 +444,9 @@ export function ChatPane({ convId, members, title }: Props) {
 	const loadingOlder = useStore(
 		(s) => s.convs.get(convId)?.loadingOlder ?? false,
 	);
-	const appendUserMessage = useStore((s) => s.appendUserMessage);
+	const messagesHydrated = useStore(
+		(s) => s.convs.get(convId)?.messagesHydrated ?? false,
+	);
 	const appendUserImage = useStore((s) => s.appendUserImage);
 	const appendUserFile = useStore((s) => s.appendUserFile);
 	const applyChunkToConv = useStore((s) => s.applyChunkToConv);
@@ -171,9 +464,11 @@ export function ChatPane({ convId, members, title }: Props) {
 		null,
 	);
 	const refreshConversationSnapshot = useCallback(async () => {
-		const [convRes, messagesRes] = await Promise.allSettled([
+		const [convRes] = await Promise.allSettled([
 			api.getConv(convId),
-			api.convMessages(convId, { limit: 50 }),
+			hydrateLatestMessagesFromRequest(convId, () =>
+				api.convMessages(convId, { limit: 50 }),
+			),
 		]);
 		if (convRes.status === "fulfilled") {
 			const conv = convRes.value;
@@ -184,13 +479,7 @@ export function ChatPane({ convId, members, title }: Props) {
 				}),
 			);
 		}
-		if (messagesRes.status === "fulfilled") {
-			hydrateMessages(convId, messagesRes.value.messages, {
-				mode: "replace",
-				hasMore: messagesRes.value.has_more,
-			});
-		}
-	}, [convId, hydrateMessages]);
+	}, [convId]);
 
 	const wsRef = useRef<ConvWebSocket | null>(null);
 	const bodyRef = useRef<HTMLDivElement>(null);
@@ -214,7 +503,7 @@ export function ChatPane({ convId, members, title }: Props) {
 	// other — defensive against double-submit (Strict Mode / accidental
 	// double-Enter / Enter+click). Otherwise the agent sees N copies and
 	// its native session bloats with phantom turns.
-	const lastSentRef = useRef<{ text: string; ts: number } | null>(null);
+	const lastSentRef = useRef<ChatSendAttempt | null>(null);
 	const markReadTimerRef = useRef<number | null>(null);
 	const markCurrentConvRead = useCallback(() => {
 		if (markReadTimerRef.current !== null) return;
@@ -356,20 +645,21 @@ export function ChatPane({ convId, members, title }: Props) {
 						// A live-only card the server cleared (e.g. the retry notice once
 						// a real response arrived). Drop it so it doesn't linger.
 						const d = (chunk as any).data;
-						if (d?.id) useStore.getState().removeMessage(convId, d.id);
+						if (d?.id) {
+							applyIncomingMessageRemoval({
+								convId,
+								msgId: d.id,
+								refresh: refreshConversationSnapshot,
+							});
+						}
 					} else if (chunk.type === "data-message-updated") {
 						const d = (chunk as any).data;
 						if (d?.id && d?.payload) {
-							useStore.setState((s) => {
-								const cs = s.convs.get(convId);
-								if (!cs) return {};
-								const msg = cs.msgById.get(d.id);
-								if (!msg) return {};
-								const msgById = new Map(cs.msgById);
-								msgById.set(d.id, { ...msg, payload: d.payload });
-								const convs = new Map(s.convs);
-								convs.set(convId, { ...cs, msgById });
-								return { convs };
+							applyIncomingMessagePayloadUpdate({
+								convId,
+								msgId: d.id,
+								payload: d.payload,
+								refresh: refreshConversationSnapshot,
 							});
 						}
 					} else if (chunk.type === "data-conv-rewound") {
@@ -378,14 +668,24 @@ export function ChatPane({ convId, members, title }: Props) {
 						// if we already truncated locally this is a no-op.
 						const d = (chunk as any).data;
 						if (d?.from_msg_id) {
-							useStore.getState().truncateMessagesFrom(convId, d.from_msg_id);
+							useStore
+								.getState()
+								.truncateMessagesFrom(convId, d.from_msg_id, d.rewind_id);
+							// If the boundary lived in an unloaded older page, truncate must
+							// conservatively clear the visible suffix. Rehydrate the authoritative
+							// newest page so unaffected history is restored without manual refresh.
+							void refreshConversationSnapshot();
 						}
 					} else if (chunk.type === "data-conv-cleared") {
 						// Conv was wiped server-side (POST /clear). Drop the in-memory
 						// timeline AND the diff/conflict-loop cards (conflicts + pending
 						// edits + pending access) so the open chat empties without a
 						// refresh — matches the server now clearing those tables too.
-						hydrateMessages(convId, [], { mode: "replace", hasMore: false });
+						hydrateMessages(convId, [], {
+							mode: "replace",
+							hasMore: false,
+							destructive: true,
+						});
 						useStore.setState((s) => {
 							const conflictsByConv = new Map(s.conflictsByConv);
 							const pendingEditsByConv = new Map(s.pendingEditsByConv);
@@ -476,6 +776,7 @@ export function ChatPane({ convId, members, title }: Props) {
 							messageId: cardId,
 							senderId: anyChunk.sender_id ?? null,
 							turnId: anyChunk.turn_id ?? null,
+							inReplyTo: anyChunk.in_reply_to ?? null,
 						});
 						// A fresh chat file card auto-opens the right-rail preview so
 						// the user sees what the agent just produced without clicking.
@@ -578,6 +879,7 @@ export function ChatPane({ convId, members, title }: Props) {
 			offResume();
 			offNet();
 			window.removeEventListener("polynoia:reconnect", refresh);
+			clearChatPaneSocketIfCurrent(wsRef, ws);
 			ws.close();
 		};
 	}, [convId, applyChunkToConv, hydrateMessages, refreshConversationSnapshot]);
@@ -590,14 +892,11 @@ export function ChatPane({ convId, members, title }: Props) {
 	useEffect(() => {
 		let cancelled = false;
 		setLoadingOlder(convId, true);
-		api
-			.convMessages(convId, { limit: 50 })
-			.then(({ messages, has_more }) => {
+		hydrateLatestMessagesFromRequest(convId, () =>
+			api.convMessages(convId, { limit: 50 }),
+		)
+			.then(() => {
 				if (cancelled) return;
-				hydrateMessages(convId, messages, {
-					mode: "replace",
-					hasMore: has_more,
-				});
 			})
 			.catch(() => {
 				if (!cancelled) setLoadingOlder(convId, false);
@@ -648,15 +947,16 @@ export function ChatPane({ convId, members, title }: Props) {
 			// Snapshot scroll position before prepend so we can restore offset
 			const prevScrollHeight = el.scrollHeight;
 			try {
-				const { messages: older, has_more } = await api.convMessages(convId, {
-					limit: 50,
-					before: cursor,
-					// Pair the timestamp with the oldest row's id (composite cursor) so
-					// scroll-up can advance past a millisecond shared by >50 rows —
-					// without it the conversation start is unreachable.
-					beforeId: oldestId,
-				});
-				hydrateMessages(convId, older, { mode: "prepend", hasMore: has_more });
+				await hydrateOlderMessagesFromRequest(convId, () =>
+					api.convMessages(convId, {
+						limit: 50,
+						before: cursor,
+						// Pair the timestamp with the oldest row's id (composite cursor) so
+						// scroll-up can advance past a millisecond shared by >50 rows —
+						// without it the conversation start is unreachable.
+						beforeId: oldestId,
+					}),
+				);
 				// After render restore relative scroll so view doesn't jump
 				requestAnimationFrame(() => {
 					const newScrollHeight = el.scrollHeight;
@@ -1007,10 +1307,39 @@ export function ChatPane({ convId, members, title }: Props) {
 			activeAgents.filter((a) => {
 				if (activeBurstAgents.has(a.id)) return false;
 				if (activeDiscussionAgents.has(a.id)) return false;
-				return !messages.some((m) => messageIsFreshForAgent(m, a.id, a.ts));
+				// A regenerate/resend pre-creates an EMPTY reused agent message and
+				// stamps created_at=now, which made messageIsFreshForAgent true and
+				// SUPPRESSED the typing placeholder while no content was rendering yet
+				// (the "进行中" indicator vanished on regenerate). Only count the agent
+				// as "already replying" — and thus hide the placeholder — once its
+				// message has actually started rendering (live stream OR real content),
+				// not merely because an empty row exists.
+				return !messages.some(
+					(m) =>
+						messageIsFreshForAgent(m, a.id, a.ts) &&
+						(streamingMessageIdsForRender.has(m.id) ||
+							isRenderableMessagePayload(m.payload, false)),
+				);
 			}),
-		[activeAgents, activeBurstAgents, activeDiscussionAgents, messages],
+		[
+			activeAgents,
+			activeBurstAgents,
+			activeDiscussionAgents,
+			messages,
+			streamingMessageIdsForRender,
+		],
 	);
+
+	// Legacy <ask-form> answers: the AskFormPart card already shows the user's
+	// answer inline (its `followingYou` readback), so rendering that same `you`
+	// message ALSO as a normal bubble duplicated it (「答案填进工具块,不要再单独
+	// 渲染一个用户回答」). Skip the bubble — the card is the canonical surface.
+	// Blocking ask_user stamps onto the card (no separate `you` message), so only
+	// the legacy text path is affected. Matches AskFormPart: the FIRST `you` after
+	// the card is the answer.
+	const askAnswerSkip = useMemo(() => {
+		return computeAskAnswerSkip(orderedMessages);
+	}, [orderedMessages]);
 
 	const claimedSet = useMemo(() => {
 		const out = new Set<string>(burstClaimedSet);
@@ -1032,6 +1361,7 @@ export function ChatPane({ convId, members, title }: Props) {
 		firstOfRun,
 		reasoningGroupIds,
 		reasoningSkip,
+		lastRunSender,
 	} = useMemo(() => {
 		const byId =
 			useStore.getState().convs.get(convId)?.msgById ??
@@ -1076,8 +1406,13 @@ export function ChatPane({ convId, members, title }: Props) {
 		const firstOfRun = new Set<string>();
 		let prevRunSender: string | null = null;
 		for (const m of orderedMessages) {
-			if (claimedSet.has(m.id) || skip.has(m.id) || reasoningSkip.has(m.id))
-				continue; // lane / tool-folded / merged-reasoning member
+			if (
+				claimedSet.has(m.id) ||
+				askAnswerSkip.has(m.id) ||
+				skip.has(m.id) ||
+				reasoningSkip.has(m.id)
+			)
+				continue; // lane / ask-answer / tool-folded / merged-reasoning member
 			// A fold-group HEAD (tool fold OR merged-reasoning) renders as a group
 			// regardless of whether its first member's payload is individually
 			// renderable — e.g. a run that starts with an empty `reasoning` (len 0)
@@ -1104,12 +1439,17 @@ export function ChatPane({ convId, members, title }: Props) {
 			firstOfRun,
 			reasoningGroupIds: reasoningGroups,
 			reasoningSkip,
+			// Sender of the LAST avatar-bearing element in the stream. The live
+			// pending placeholders render AFTER this loop, so they need it to
+			// continue the same agent's run (suppress a duplicate avatar block).
+			lastRunSender: prevRunSender,
 		};
 	}, [
 		burstSig,
 		renderSig,
 		convId,
 		claimedSet,
+		askAnswerSkip,
 		burstByAnchorId,
 		discussionByAnchorId,
 		streamingMessageIdsForRender,
@@ -1266,6 +1606,8 @@ export function ChatPane({ convId, members, title }: Props) {
 	};
 
 	const clearAgentTurnForRegenerate = (first: Message, ids: string[]): void => {
+		useStore.getState().invalidateMessageHydrations(convId);
+		useStore.getState().markMessagesMutated(convId, [first.id]);
 		useStore.setState((s) => {
 			const cs = s.convs.get(convId);
 			if (!cs) return {};
@@ -1302,21 +1644,54 @@ export function ChatPane({ convId, members, title }: Props) {
 		if (regeneratingTurnId) return;
 		const text = textFromMessage(turn.user);
 		if (!text) return;
+		// G: regenerate is now a true FORK — rolling back this turn deletes every
+		// later message AND restores the workspace to before this turn's writes
+		// (irreversible). Gate it behind an explicit red rollback warning.
+		if (!window.confirm(t("rewindResendWarn", lang))) return;
 		setRegeneratingTurnId(turn.first.id);
-		clearAgentTurnForRegenerate(turn.first, turn.ids);
-		const results = await Promise.allSettled(
-			turn.ids.map((id) => api.deleteMessage(convId, id, { silent: true })),
-		);
-		for (const r of results) {
-			if (r.status === "rejected") {
-				console.warn("failed to delete old regenerated turn message", r.reason);
-			}
+		try {
+			// rewind = delete from turn.first onward + restore workspace main; the
+			// server broadcasts data-conv-rewound so the local timeline truncates too.
+			// MUST succeed before we resend: if it fails (e.g. the target was already
+			// rewound away → 404), the rollback did NOT happen, so re-running here
+			// would carry the old context/files forward (the「回滚失败却照样重发 →
+			// 上下文还在」bug). Abort with a visible error instead of silently
+			// proceeding, and don't touch local state until the rollback lands.
+			const rewind = await api.rewindConv(convId, turn.first.id);
+			useStore
+				.getState()
+				.truncateMessagesFrom(convId, turn.first.id, rewind.rewind_id);
+		} catch (e) {
+			console.warn("rewind (regenerate) failed", e);
+			setRegeneratingTurnId(null);
+			window.alert(t("rewindFailed", lang));
+			return;
 		}
-		wsRef.current?.sendUserMessage(text, members, undefined, undefined, {
-			regenerate: true,
-			regenerateMsgId: turn.first.id,
-			regenerateSenderId: turn.first.sender_id,
-		});
+		if (wsRef.current?.convId !== convId) {
+			setRegeneratingTurnId(null);
+			window.alert("会话连接已切换，未发送重新生成请求。");
+			void refreshConversationSnapshot();
+			return;
+		}
+		clearAgentTurnForRegenerate(turn.first, turn.ids);
+		if (
+			!sendRegenerationOnCurrentSocket({
+				convId,
+				text,
+				members,
+				getWs: () => wsRef.current,
+				options: {
+					regenerate: true,
+					regenerateMsgId: turn.first.id,
+					regenerateSenderId: turn.first.sender_id,
+				},
+			})
+		) {
+			window.alert("会话连接已切换，未发送重新生成请求。");
+			setRegeneratingTurnId(null);
+			void refreshConversationSnapshot();
+			return;
+		}
 		window.setTimeout(() => setRegeneratingTurnId(null), 1500);
 	};
 
@@ -1364,6 +1739,36 @@ export function ChatPane({ convId, members, title }: Props) {
 			first ??= m;
 			ids.push(m.id);
 		}
+		// G: resend is a true FORK — only warn/rollback when there's a later reply
+		// to delete (else it's just a re-run of the last message).
+		if (first && !window.confirm(t("rewindResendWarn", lang))) return;
+		// Roll back FIRST, before any optimistic local mutation. If the rewind
+		// fails (target already gone → 404), the rollback did NOT happen, so we must
+		// NOT resend — that would re-run with the old context/files intact (the
+		//「回滚失败却照样重发 → 上下文还在」bug). Abort with a visible error and leave
+		// the UI untouched. (rewind starts at the first REPLY, so the edited user
+		// message itself survives and is updated below.)
+		if (first) {
+			try {
+				const rewind = await api.rewindConv(convId, first.id);
+				useStore
+					.getState()
+					.truncateMessagesFrom(convId, first.id, rewind.rewind_id);
+			} catch (e) {
+				console.warn("rewind (resend) failed", e);
+				window.alert(t("rewindFailed", lang));
+				return;
+			}
+		}
+		if (wsRef.current?.convId !== convId) {
+			window.alert("会话连接已切换，未执行重发。");
+			void refreshConversationSnapshot();
+			return;
+		}
+		useStore.getState().invalidateMessageHydrations(convId);
+		useStore
+			.getState()
+			.markMessagesMutated(convId, [msgId, ...(first ? [first.id] : [])]);
 		useStore.setState((s) => {
 			const cs = s.convs.get(convId);
 			if (!cs) return {};
@@ -1398,17 +1803,30 @@ export function ChatPane({ convId, members, title }: Props) {
 			});
 			return { convs };
 		});
-		await api.updateMessage(convId, msgId, text.trim());
-		if (ids.length) {
-			await Promise.allSettled(
-				ids.map((id) => api.deleteMessage(convId, id, { silent: true })),
-			);
+		try {
+			await api.updateMessage(convId, msgId, text.trim());
+		} catch (error) {
+			console.warn("update message (resend) failed", error);
+			window.alert("消息更新失败，未执行重发。");
+			void refreshConversationSnapshot();
+			return;
 		}
-		wsRef.current?.sendUserMessage(text.trim(), members, undefined, undefined, {
-			regenerate: true,
-			regenerateMsgId: first?.id,
-			regenerateSenderId: first?.sender_id,
-		});
+		if (
+			!sendRegenerationOnCurrentSocket({
+				convId,
+				text: text.trim(),
+				members,
+				getWs: () => wsRef.current,
+				options: {
+					regenerate: true,
+					regenerateMsgId: first?.id,
+					regenerateSenderId: first?.sender_id,
+				},
+			})
+		) {
+			window.alert("会话连接已切换，未执行重发。");
+			void refreshConversationSnapshot();
+		}
 	};
 
 	const senderLabelFor = (m: Message | undefined): string => {
@@ -1639,7 +2057,15 @@ export function ChatPane({ convId, members, title }: Props) {
 									<span className="h-px w-12 bg-[var(--color-line)]" />
 								</div>
 							)}
-							{!messages.length && (
+							{/* Initial history still echoing in — show a shape-matched skeleton,
+              never the "no messages" empty state (that would lie about a conv
+              that actually has history but hasn't loaded yet). Keyed on
+              messagesHydrated so the first visit (before the fetch effect even
+              fires) shows the skeleton, not a one-frame empty flash. */}
+							{!messagesHydrated && messages.length === 0 && (
+								<ChatMessagesSkeleton />
+							)}
+							{messagesHydrated && messages.length === 0 && (
 								<div className="text-center text-[var(--color-fg-3)] text-[12px] py-12">
 									{t("noMessages", lang)}
 									{isGroup && (
@@ -1660,6 +2086,7 @@ export function ChatPane({ convId, members, title }: Props) {
             memoized burstByAnchorId/claimedSet above (delta-invariant). */}
 								{orderedMessages.map((m) => {
 									if (claimedSet.has(m.id)) return null; // rendered in a lane
+									if (askAnswerSkip.has(m.id)) return null; // shown in the ask-form card
 									if (groupedSkip.has(m.id)) return null; // folded into a ToolCallGroup
 									if (reasoningSkip.has(m.id)) return null; // merged into MergedReasoning
 									const group = groupFirstIds.get(m.id);
@@ -1729,23 +2156,34 @@ export function ChatPane({ convId, members, title }: Props) {
 										/>
 									);
 								})}
-								{pendingAgentPlaceholders.map((a) => {
-									const agent = agents.find((x) => x.id === a.id);
-									const label =
-										a.status === "starting"
-											? t("startingConversation", lang)
-											: phaseLabel(a.phase, a.tool, lang);
-									return (
-										<AgentExecutionPlaceholder
-											key={`pending-${a.id}`}
-											agent={agent}
-											agentId={a.id}
-											label={label}
-											mobile={mobile}
-											lang={lang}
-										/>
-									);
-								})}
+								{(() => {
+									// Continue the message stream's avatar run: a placeholder
+									// for the SAME agent as the element directly above it (the
+									// last rendered message, or the previous placeholder) drops
+									// its avatar + name header so the agent shows ONE avatar
+									// block, not a duplicate "执行中" header.
+									let prevSender = lastRunSender;
+									return pendingAgentPlaceholders.map((a) => {
+										const agent = agents.find((x) => x.id === a.id);
+										const label =
+											a.status === "starting"
+												? t("startingConversation", lang)
+												: phaseLabel(a.phase, a.tool, lang);
+										const showAvatar = a.id !== prevSender;
+										prevSender = a.id;
+										return (
+											<AgentExecutionPlaceholder
+												key={`pending-${a.id}`}
+												agent={agent}
+												agentId={a.id}
+												label={label}
+												mobile={mobile}
+												lang={lang}
+												showAvatar={showAvatar}
+											/>
+										);
+									});
+								})()}
 							</div>
 							{quoteMenu && (
 								<div
@@ -1790,17 +2228,30 @@ export function ChatPane({ convId, members, title }: Props) {
 				    below) so it never floats over / hides message content. */}
 				{/* Agent-initiated questions — floating panel above Composer */}
 				<div className="mx-auto w-full max-w-[var(--composer-measure)]">
-					<AskFormsPanel convId={convId} members={members} ws={wsRef.current} />
+					<AskFormsPanel
+						convId={convId}
+						members={members}
+						getWs={() => wsRef.current}
+					/>
 
 					{/* Composer */}
 					<Composer
 						convId={convId}
 						members={members}
+						// A seeded/persisted draft is a *starter* for a pristine conv. Once
+						// the conv has any history (it's been sent — possibly by another
+						// client or an external driver, which clears draft_text server-side
+						// but leaves this client's convSummary snapshot stale), the starter
+						// must NOT re-fill the box. Gating on an empty stream keeps the
+						// seeded prompt from lingering during/after a running turn. Typing a
+						// follow-up uses the composer's own local state, so it's unaffected.
 						draftText={
-							convSummary?.id === convId ? convSummary.draft_text : undefined
+							convSummary?.id === convId && messages.length === 0
+								? convSummary.draft_text
+								: undefined
 						}
 						draftAttachments={
-							convSummary?.id === convId
+							convSummary?.id === convId && messages.length === 0
 								? convSummary.draft_attachments
 								: undefined
 						}
@@ -1923,22 +2374,28 @@ export function ChatPane({ convId, members, title }: Props) {
 									/* file survives session even if persist fails */
 								});
 						}}
-						onSend={(text, inReplyTo) => {
-							const now = Date.now();
-							const last = lastSentRef.current;
-							if (last && last.text === text && now - last.ts < 500) {
-								// Same text within 500ms — drop. Symptom: duplicate "你好" bubbles
-								// and agent counting phantom turns. Root cause TBD (Strict Mode
-								// / accidental double-input); this is the user-visible bandage.
-								return;
-							}
-							lastSentRef.current = { text, ts: now };
+						onSend={(text, inReplyTo, replyingTo, recoveryDraft) => {
+							const attempt = claimChatSendAttempt(lastSentRef, {
+								convId,
+								text,
+								inReplyTo,
+							});
+							if (!attempt) return;
 							// Pre-allocate the id so the optimistic local message AND the
 							// server-persisted row carry the SAME id. Without this, rewind /
 							// reply / pin on a freshly-sent message fail with 404 because
 							// the client holds `u-<uuid>` while the DB has its own ULID.
-							const msgId = appendUserMessage(convId, text, inReplyTo);
-							wsRef.current?.sendUserMessage(text, members, inReplyTo, msgId);
+							sendChatPaneComposerMessage({
+								convId,
+								text,
+								members,
+								inReplyTo,
+								replyingTo,
+								recoveryDraft,
+								getWs: () => wsRef.current,
+								lastSentRef,
+								attempt,
+							});
 						}}
 					/>
 				</div>

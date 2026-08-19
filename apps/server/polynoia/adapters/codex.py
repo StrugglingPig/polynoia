@@ -100,14 +100,36 @@ from polynoia.adapters.base import (
     TurnStartedEvent,
 )
 from polynoia.credentials import sync_codex_home
-from polynoia.domain.messages import TextBlock as PNTextBlock
-from polynoia.domain.messages import ReasoningPayload, TextPayload, ToolCallPayload
+from polynoia.domain.messages import (
+    ReasoningPayload,
+    TextPayload,
+    ToolCallPayload,
+)
+from polynoia.domain.messages import (
+    TextBlock as PNTextBlock,
+)
 from polynoia.sandbox import Sandbox
 from polynoia.settings import settings
 
 log = logging.getLogger(__name__)
 
 ToolCallState = Literal["pending", "running", "completed", "error"]
+
+
+def _codex_events_enabled() -> bool:
+    """Permanent, opt-in Codex event tracing. OFF by default; set
+    ``POLYNOIA_LOG_CODEX_EVENTS=1`` to trace the raw event stream (every
+    app-server method / exec JSONL item + tool type/status/args) via
+    ``log.debug`` — for debugging "lost streaming" and tool-card issues.
+    Mirrors the claude adapter's ``POLYNOIA_LOG_CLAUDE_EVENTS``.
+
+    The app configures logging at INFO (main.py), so ``log.debug`` is silent by
+    default. When the flag is on we raise THIS module's logger to DEBUG so the
+    trace actually surfaces — without turning on DEBUG globally."""
+    enabled = os.environ.get("POLYNOIA_LOG_CODEX_EVENTS") == "1"
+    if enabled and log.getEffectiveLevel() > logging.DEBUG:
+        log.setLevel(logging.DEBUG)
+    return enabled
 
 
 def _friendly_codex_exception(e: Exception) -> str:
@@ -369,7 +391,7 @@ class CodexAdapter:
         read_only_workspace_id: str | None = None,
         proxy: str | None = None,
         proxy_kind: str = "system",
-        skills: list[str] | None = None,  # accepted for adapter parity (Codex skill placement: P1)
+        skills: list[str] | None = None,
     ) -> CodexSession:
         # P1.1 routing — see workspace-shared-git.md. read_only_workspace_id:
         # project-external DM opens its agent's workspace READ-ONLY (ADR-019).
@@ -385,6 +407,13 @@ class CodexAdapter:
             ) or await Sandbox.create(conv_id)
         else:
             sandbox = await Sandbox.create(conv_id)
+
+        # Legacy/non-project sandboxes are conv-scoped and do not carry the
+        # contact id from construction; attach it to this session's handle so
+        # the Skill runtime HOME remains contact-scoped in group DMs too.
+        if agent_id and sandbox.agent_id is None:
+            sandbox.agent_id = agent_id
+        await sandbox.place_skill_packages(skills or [], adapter_id=self.meta.agent_id)
 
         # The sandbox has already snapshotted the user's ~/.codex/{config.toml,
         # auth.json, sessions} into this CODEX_HOME (Sandbox._copy_host_credentials).
@@ -532,6 +561,12 @@ class CodexSession:
         # that env_for_agent points at. Nothing backend-specific is hardcoded.
         env = self._sandbox.env_for_agent(self._extra_env)
         env["CODEX_HOME"] = self._codex_home
+        # Codex discovers user-scoped skills from ~/.agents/skills. Keep HOME
+        # contact-scoped while CODEX_HOME continues to point at the isolated
+        # credential/config snapshot.
+        skill_home = self._sandbox.agent_runtime_home("codex")
+        env["HOME"] = str(skill_home)
+        env["USERPROFILE"] = str(skill_home)
         return env
 
     async def send(
@@ -1028,10 +1063,21 @@ def _v2_item_to_toolcall(item: dict[str, Any]) -> ToolCallPayload | None:
             if result
             else (err.get("message") if err else None)
         )
+        # input_preview = the args JSON so the running write card streams content
+        # (frontend WriteStreamCard reads input_preview). codex delivers arguments
+        # ATOMICALLY (no per-token arg deltas in the app-server protocol), so this
+        # can't animate line-by-line like claude — but on item/started the running
+        # card now shows the file body instead of a blank "准备写入…" before the
+        # diff card lands. HEAD-capped (first ~2k) to keep the frontend's
+        # head-anchored ``"content":"`` parser working and avoid pushing multi-KB.
+        _args = item.get("arguments") or {}
+        _arg_str = _args if isinstance(_args, str) else json.dumps(_args, ensure_ascii=False)
+        _preview = _arg_str if len(_arg_str) <= 2000 else (_arg_str[:2000] + "…")
         return ToolCallPayload(
             tool_call_id=item_id,
             name=f"{item.get('server', 'mcp')}::{item.get('tool', '')}",
             input=item.get("arguments") or {},
+            input_preview=_preview,
             state=_codex_v2_status_to_state(status),
             is_error=status == "failed",
             output=result.get("content") or err.get("message"),
@@ -1066,6 +1112,12 @@ async def _translate_appserver_turn(
     reasoning_start: dict[str, float] = {}
     usage: dict[str, Any] = {}
     terminal = False
+    # Opt-in event trace (permanent; off by default). Enable with
+    # POLYNOIA_LOG_CODEX_EVENTS=1 to log every app-server method + tool-item
+    # type/status/args as the turn streams — the way to debug "lost streaming"
+    # (e.g. a write card that never appears, or atomic-vs-streamed tool args).
+    # Mirrors the claude adapter's POLYNOIA_LOG_CLAUDE_EVENTS.
+    _debug = _codex_events_enabled()
 
     def _keys(item_id: str) -> tuple[str, str]:
         if item_id not in keys:
@@ -1077,6 +1129,8 @@ async def _translate_appserver_turn(
             break
         method = note.get("method")
         params = note.get("params") or {}
+        if _debug:
+            log.debug("codex app-server method=%s", method)
 
         if method == "turn/started":
             tid = (params.get("turn") or {}).get("id")
@@ -1131,6 +1185,21 @@ async def _translate_appserver_turn(
             itype = item.get("type")
             item_id = item.get("id") or _new_id()
             mid, pid = _keys(item_id)
+            if _debug:
+                # Log EVERY item (not just the 3 tool types) so the trace reveals
+                # exactly which itype codex uses to write a file and whether it
+                # streams (item/started with args) or pops in (only item/completed).
+                _a = item.get("arguments")
+                log.debug(
+                    "codex item %s itype=%s status=%s server=%s tool=%s has_args=%s args_len=%s",
+                    method,
+                    itype,
+                    item.get("status"),
+                    item.get("server"),
+                    item.get("tool"),
+                    _a is not None,
+                    len(str(_a)) if _a else 0,
+                )
 
             if itype == "userMessage":
                 continue  # our own echoed input — not shown
@@ -1381,9 +1450,7 @@ async def _translate_codex_stream(
                         part=ReasoningPayload(body=[PNTextBlock(c=cur)], seconds=secs),
                     )
                 continue
-            elif inner == "command_execution":
-                continue
-            elif inner == "file_change":
+            elif inner in {"command_execution", "file_change"}:
                 continue
             elif inner == "mcp_tool_call":
                 yield PartCompletedEvent(

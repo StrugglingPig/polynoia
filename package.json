@@ -1,6 +1,7 @@
 {
   "name": "polynoia",
-  "version": "0.1.1",
+  "version": "0.1.4",
+  "license": "Apache-2.0",
   "private": true,
   "description": "Polynoia (AgentHub) — IM-style multi-agent collaboration platform",
   "workspaces": [
@@ -19,7 +20,8 @@
     "format": "biome format --write ."
   },
   "devDependencies": {
-    "@biomejs/biome": "^1.9.4"
+    "@biomejs/biome": "^1.9.4",
+    "@playwright/test": "^1.61.0"
   },
   "packageManager": "pnpm@9.0.0"
 }

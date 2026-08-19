@@ -158,8 +158,9 @@ class ClaudeCodeAdapter:
         # Contact-level skill packages: copy each bound skill folder into the
         # sandbox's native ~/.claude/skills/ so the underlying Claude CLI
         # discovers them (progressive disclosure) and can run their scripts.
-        if skills:
-            await sandbox.place_skill_packages(skills)
+        placed_skills = await sandbox.place_skill_packages(
+            skills or [], adapter_id=self.meta.agent_id
+        )
 
         # Register the Polynoia MCP server. Claude Code spawns it as a stdio
         # subprocess; POLYNOIA_CONV_ID + POLYNOIA_AGENT_ID bind that MCP instance
@@ -281,12 +282,22 @@ class ClaudeCodeAdapter:
         # the user persona EXTENDS the default. If no user persona is set,
         # pass system_prompt=None — SDK defaults stay clean.
         sys_prompt_param: str | dict[str, Any] | None
+        # ORCHESTRATOR gets OUR prompt as the BASE — not Claude Code's coding-agent
+        # preset. The preset is trained to "narrate a plan / make todos / write code
+        # directly", which fights the orchestrator's actual job (call dispatch /
+        # ask_user / discuss / present). That mismatch produced narrate-then-stop
+        # dead-ends (the model wrote "下面去调 ask_user" then ended with 0 tool calls
+        # — observed ~15% of group turns). Tool-call MECHANICS are handled by the
+        # SDK/API, not the preset, so dropping it doesn't hurt tool use; it just lets
+        # the dispatcher protocol lead. WORKERS / DMs keep the coding preset (they DO
+        # write code). Detected by the orchestrator-protocol marker in the prompt.
+        _is_orchestrator = bool(system_prompt and "你是本群聊的协调器" in system_prompt)
         if system_prompt and system_prompt.strip():
-            sys_prompt_param = {
-                "type": "preset",
-                "preset": "claude_code",
-                "append": system_prompt,
-            }
+            sys_prompt_param = (
+                system_prompt
+                if _is_orchestrator
+                else {"type": "preset", "preset": "claude_code", "append": system_prompt}
+            )
         else:
             sys_prompt_param = None
         # Capture claude CLI stderr so it can be surfaced in error messages.
@@ -321,6 +332,10 @@ class ClaudeCodeAdapter:
             tools=[],                       # no built-ins — MCP tools only
             allowed_tools=effective_allowed,
             setting_sources=[],             # don't inherit parent skills/plugins
+            # SDK-level allowlist enables only this contact's bound packages.
+            # It also exposes the native progressive-disclosure Skill tool
+            # without re-enabling unrelated Claude Code built-ins.
+            skills=placed_skills,
             strict_mcp_config=True,         # only the `polynoia` MCP server
             permission_mode="bypassPermissions",   # MCP boundary suffices
             model=model,
@@ -546,11 +561,27 @@ async def _translate_claude_stream(
                                 # Stream the raw args into the EXPANDABLE body
                                 # (input_preview), not the one-line summary, so
                                 # the user can open the fold and watch them build.
-                                # Send only the TAIL (last ~2k chars) so a multi-KB
-                                # dispatch doesn't re-push the whole growing buffer
-                                # every tick (O(N²) → O(N)); the full input lands
-                                # on completion anyway.
-                                preview = buf if len(buf) <= 2000 else ("…" + buf[-2000:])
+                                # WINDOW the preview so the live write card keeps
+                                # STREAMING (WriteStreamCard auto-scrolls to the
+                                # newest content) while staying parseable AND bounded:
+                                #  · HEAD keeps the ``{"path":...,"content":"`` anchor —
+                                #    the frontend's extractWriteFields is HEAD-anchored
+                                #    (matches the literal ``"content":"`` near the START);
+                                #    drop it and content won't parse → the card freezes
+                                #    at "准备写入…".
+                                #  · TAIL keeps the lines being written RIGHT NOW so the
+                                #    card shows live progress instead of a frozen prefix.
+                                # Re-pushing a fixed-size window each tick is O(N), not
+                                # O(N²); the full input lands on completion anyway.
+                                if len(buf) <= 4000:
+                                    preview = buf
+                                else:
+                                    head = buf[:300].rstrip("\\")
+                                    tail = buf[-3600:]
+                                    # don't start the tail on a dangling escape half
+                                    if tail[:1] in ('"', "\\"):
+                                        tail = tail[1:]
+                                    preview = head + "…" + tail
                                 updated = prev.model_copy(update={
                                     "input_preview": preview,
                                     "summary": "生成参数中…",
@@ -707,13 +738,23 @@ async def _translate_claude_stream(
                 elif msg.subtype and msg.subtype != "success":
                     message = msg.subtype
                 else:
-                    # Fall back: include the underlying SDK error list if any
+                    # Fall back: include the underlying SDK error list if any.
+                    # The CLI also surfaces a human message in `result` for
+                    # pre-flight failures that have no api_error_status / errors
+                    # — e.g. an unauthenticated CLI returns
+                    # ``is_error=True, subtype="success", result="Not logged in
+                    # · Please run /login"``. Without checking `result` the user
+                    # sees the useless "agent turn failed (no further detail)"
+                    # AND we miss the "logged in" / "/login" rate markers that
+                    # would route this to the retryable-credential path.
                     errors = getattr(msg, "errors", None) or []
-                    message = (
-                        "; ".join(str(e) for e in errors)
-                        if errors
-                        else "agent turn failed (no further detail)"
-                    )
+                    result_text = (getattr(msg, "result", None) or "").strip()
+                    if errors:
+                        message = "; ".join(str(e) for e in errors)
+                    elif result_text:
+                        message = result_text
+                    else:
+                        message = "agent turn failed (no further detail)"
                 yield TurnFailedEvent(
                     turn_id=turn_id,
                     task_id=task_id,

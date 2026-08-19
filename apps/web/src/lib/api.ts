@@ -145,10 +145,24 @@ export type ProcessRunItem = {
 /** Back-compat alias for older imports; semantically this is now ProcessRun. */
 export type ServiceItem = ProcessRunItem;
 
-async function getJSON<T>(path: string): Promise<T> {
-	const res = await fetch(apiUrl(path));
-	if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
-	return res.json() as Promise<T>;
+async function getJSON<T>(path: string, timeoutMs = 12000): Promise<T> {
+	// Abortable timeout: without it a stalled backend (e.g. a read stuck behind a
+	// write-lock under burst load) leaves the caller spinning forever. With it the
+	// fetch rejects, which callers surface as a retryable error state.
+	const ctrl = new AbortController();
+	const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+	try {
+		const res = await fetch(apiUrl(path), { signal: ctrl.signal });
+		if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+		return (await res.json()) as T;
+	} catch (e) {
+		if (e instanceof DOMException && e.name === "AbortError") {
+			throw new Error(`timeout after ${Math.round(timeoutMs / 1000)}s`);
+		}
+		throw e;
+	} finally {
+		clearTimeout(timer);
+	}
 }
 
 async function postJSON<T>(path: string, body?: unknown): Promise<T> {
@@ -241,10 +255,19 @@ export type ConversationSummary = {
 	running_agents?: Array<{
 		agent_id: string;
 		status: "starting" | "streaming" | "idle" | "aborted" | "error";
-		phase?: "thinking" | "executing" | "replying";
+		phase?: "thinking" | "generating" | "executing" | "replying";
 		tool?: string;
 		message?: string;
 	}>;
+	/** Newest message preview for the sidebar subtitle (微信/Slack-style).
+	 * Derived server-side, route-injected like running_agents. `text` is the
+	 * flattened body for text/reasoning messages and "" for the other card
+	 * kinds — for those the client localizes a label from `last_message_kind`.
+	 * sender_id is "you" or an agent id; kind is the payload discriminator.
+	 * All absent/null when the conversation has no messages yet. */
+	last_message_text?: string;
+	last_message_sender_id?: string | null;
+	last_message_kind?: string | null;
 };
 
 export type DraftAttachment = {
@@ -373,6 +396,10 @@ export const api = {
 			`/api/conversations/${convId}/messages/${msgId}`,
 			{ text },
 		),
+	interruptStuckWrite: (convId: string, msgId: string) =>
+		patchJSON<{ ok: boolean; updated: boolean }>(
+			`/api/conversations/${convId}/messages/${msgId}/interrupt-stuck-write`,
+		),
 	/** Single-conv summary fetch. Returns the same shape as the list endpoint. */
 	/** Upload an attachment (raw bytes) → returns a server URL to reference in
 	 * the message payload (instead of inlining base64). */
@@ -429,7 +456,7 @@ export const api = {
 	/** Resolve a blocking `ask_user` tool call (⑥) — the suspended agent turn
 	 * continues with this answer. Only used for blocking_tool ask-forms. */
 	answerAsk: (convId: string, askId: string, answer: string) =>
-		postJSON<{ ok: boolean }>(
+		postJSON<{ ok: boolean; orphaned?: boolean }>(
 			`/api/conversations/${convId}/ask/${askId}/answer`,
 			{ answer },
 		),
@@ -573,6 +600,8 @@ export const api = {
 		tool_role?: string;
 		tools_whitelist?: string[];
 		max_context_tokens?: number | null;
+		api_key?: string;
+		api_base_url?: string | null;
 		skills?: { name: string; instructions: string; description?: string }[];
 	}) => postJSON<{ contact: Agent }>("/api/contacts", body),
 	/**「回到这个对话」dry-run: what reverting workspace main to `sha` would undo. */
@@ -603,6 +632,7 @@ export const api = {
 	rewindConv: (convId: string, fromMsgId: string) =>
 		postJSON<{
 			ok: boolean;
+			rewind_id: string;
 			deleted: number;
 			restored: string | null;
 			undo_sha: string | null;
@@ -634,6 +664,8 @@ export const api = {
 			tool_role: string;
 			tools_whitelist: string[];
 			max_context_tokens: number | null;
+			api_key: string | null;
+			api_base_url: string | null;
 			skills: { name: string; instructions: string; description?: string }[];
 		}>,
 	) =>

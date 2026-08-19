@@ -1,7 +1,8 @@
 [package]
 name = "polynoia-desktop"
-version = "0.1.1"
+version = "0.1.4"
 description = "Polynoia desktop app (macOS / Windows / Linux) — Tauri 2 wrapper around the Polynoia web build."
+license = "Apache-2.0"
 authors = ["Polynoia Team"]
 edition = "2021"
 
@@ -14,7 +15,9 @@ path = "src/main.rs"
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = [] }
+# tray-icon: system tray (close-to-tray + restore). image-ico: load the bundled
+# .ico for the tray icon on Windows.
+tauri = { version = "2", features = ["tray-icon", "image-ico"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 

@@ -19,6 +19,7 @@ from datetime import datetime
 from typing import TYPE_CHECKING, cast
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
+from sqlalchemy.exc import IntegrityError
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -30,7 +31,7 @@ from polynoia.adapters.pool import get_pool
 # Conversation-runtime state + shared helpers (defined in routes.py; mutated in
 # place so importing the binding here is safe — see module docstring + CHARTER).
 from polynoia.api import event_log
-from polynoia.api.execution import BurstStateMachine
+from polynoia.api.execution import RUNTIME, BurstStateMachine
 from polynoia.api.routes import (
     _AGENT_IDLE_TIMEOUT,
     _AGENT_IDLE_TIMEOUT_MIDTURN,
@@ -46,8 +47,8 @@ from polynoia.api.routes import (
     _build_conflict_fix_prompt,
     _build_mention_resolver,
     _coerce_tool_state,
-    _conv_agent_locks,
     _conv_agent_discussion,
+    _conv_agent_locks,
     _conv_agent_tasks,
     _conv_agent_turn,
     _conv_bursts,
@@ -61,8 +62,6 @@ from polynoia.api.routes import (
     _error_text_from_chunk,
     _extract_ask_form_blocks,
     _extract_tasks_blocks,
-    _recover_leaked_dispatch,
-    _recover_raw_tool_protocol,
     _gather_turn_images,
     _is_bare_ack_bounce,
     _live_clear_agent,
@@ -75,24 +74,193 @@ from polynoia.api.routes import (
     _pending_dispatches,
     _persist_and_emit_error,
     _phase_from_chunk,
+    _recover_leaked_dispatch,
+    _recover_raw_tool_protocol,
     _register_conv_outbox,
     _single_direct_mention_target,
     _spawn_dispatcher,
     _spawn_turn,
+    _strip_orphan_tool_tags,
     _tap_text_into,
     _unregister_conv_outbox,
     _with_orchestrator_mention_routing_hint,
     _workspace_head_for_conv,
     log,
+    open_ask_ids,
+    orphan_conv_asks,
 )
 from polynoia.domain.messages import ConflictFile, ConflictPayload
 from polynoia.sandbox import Sandbox, workspace_merge_lock, workspace_root_for
 from polynoia.storage import repo as storage_repo
 from polynoia.storage.db import SessionLocal
+from polynoia.storage.models import MESSAGE_ID_MAX_LENGTH, MessageRow
 from polynoia.transport.adapter_to_chunk import adapter_events_to_chunks
 from polynoia.transport.ui_message_chunk import encode_polynoia_card
 
 ws_router = APIRouter()
+
+_WORKSPACE_HEAD_WAIT_SECONDS = 0.25
+_WORKSPACE_HEAD_TASK_LIMIT = 16
+_workspace_head_tasks: dict[str, asyncio.Task[str | None]] = {}
+_STARLETTE_DISCONNECT_RUNTIME_ERRORS = frozenset(
+    {
+        'WebSocket is not connected. Need to call "accept" first.',
+        'Cannot call "receive" once a disconnect message has been received.',
+    }
+)
+
+
+async def _write_streamed_tool_part(
+    *,
+    conv_id: str,
+    sender_id: str,
+    msg_id: str,
+    payload: dict | None,
+) -> bool:
+    """Write one transition while the caller owns the conversation lock.
+
+    Returns false for a late nonterminal frame after any terminal tool state.
+    Tool event streams can repeat buffered ``running`` snapshots; allowing one
+    to reopen a recovery error (or a real completion) makes both DB and UI move
+    backwards.
+    """
+    async with SessionLocal() as db:
+        existing = await db.get(MessageRow, msg_id)
+        if (
+            payload is not None
+            and payload.get("kind") == "tool-call"
+            and payload.get("state") in {"pending", "running", "run"}
+            and existing is not None
+            and isinstance(existing.payload, dict)
+            and existing.payload.get("kind") == "tool-call"
+            and existing.payload.get("state")
+            not in {None, "pending", "running", "run"}
+        ):
+            return False
+        if payload is None:
+            await storage_repo.delete_message(db, msg_id)
+        else:
+            await storage_repo.upsert_message(
+                db,
+                conv_id=conv_id,
+                sender_id=sender_id,
+                payload=payload,
+                msg_id=msg_id,
+            )
+        await db.commit()
+    return True
+
+
+async def _persist_streamed_tool_part(
+    *,
+    conv_id: str,
+    sender_id: str,
+    msg_id: str,
+    payload: dict | None,
+) -> bool:
+    """Persist one live tool transition in recovery/broadcast commit order.
+
+    The disconnect-recovery endpoint uses the same conversation transition
+    lock through its post-commit broadcast. Participating here prevents a
+    normal completion from committing while recovery is paused before emitting
+    its stale error frame (which otherwise leaves the open UI behind the DB).
+    """
+    try:
+        async with RUNTIME.user_message_lock(conv_id):
+            return await _write_streamed_tool_part(
+                conv_id=conv_id,
+                sender_id=sender_id,
+                msg_id=msg_id,
+                payload=payload,
+            )
+    finally:
+        _maybe_prune_conv(conv_id)
+
+
+def _track_workspace_head_task(task: asyncio.Task[str | None], conv_id: str) -> None:
+    """Keep a timed-out head lookup owned until its git subprocess settles."""
+    _workspace_head_tasks[conv_id] = task
+
+    def _done(done: asyncio.Task[str | None]) -> None:
+        if _workspace_head_tasks.get(conv_id) is done:
+            _workspace_head_tasks.pop(conv_id, None)
+        if done.cancelled():
+            return
+        error = done.exception()
+        if error is not None:
+            log.warning(
+                "workspace checkpoint lookup failed: conv=%s",
+                conv_id,
+                exc_info=(type(error), error, error.__traceback__),
+            )
+
+    task.add_done_callback(_done)
+
+
+async def _bounded_workspace_head_for_conv(conv_id: str) -> str | None:
+    """Return a prompt checkpoint stamp without cancelling a live git child.
+
+    ``_workspace_head_for_conv`` ultimately owns a subprocess with its own safe
+    timeout/kill/reap path. One caller waits up to the ingress budget; concurrent
+    callers fail open immediately. A slow task remains strongly owned and is
+    reused until it settles, so queued messages cannot amplify git subprocesses.
+    """
+    task = _workspace_head_tasks.get(conv_id)
+    if task is None:
+        # Each real lookup can own a git subprocess until its bounded 60-second
+        # kill/reap path finishes. Per-conversation coalescing prevents one hot
+        # conversation from amplifying work; this global admission bound also
+        # prevents many conversations from exhausting processes/file handles.
+        # Check-and-register is atomic with respect to asyncio tasks because no
+        # await occurs between the size check and `_track_workspace_head_task`.
+        if len(_workspace_head_tasks) >= _WORKSPACE_HEAD_TASK_LIMIT:
+            return None
+        task = asyncio.create_task(
+            _workspace_head_for_conv(conv_id),
+            name=f"workspace-head:{conv_id}",
+        )
+        _track_workspace_head_task(task, conv_id)
+    elif not task.done():
+        # One caller owns this lookup's short wait budget. Reuse its ownership,
+        # but never make concurrent/queued frames wait behind the same slow git.
+        return None
+    done, _pending = await asyncio.wait(
+        {task}, timeout=_WORKSPACE_HEAD_WAIT_SECONDS
+    )
+    if not done:
+        log.warning("workspace checkpoint lookup timed out: conv=%s", conv_id)
+        return None
+    if task.cancelled():
+        return None
+    try:
+        return task.result()
+    except Exception:
+        # The done callback owns exception logging/retrieval.
+        return None
+
+
+def _user_message_ack(message_id: str, *, duplicate: bool) -> str:
+    return (
+        'data: {"type":"data-user-message-ack","id":'
+        + json.dumps(message_id, ensure_ascii=False)
+        + ',"data":{"duplicate":'
+        + ("true" if duplicate else "false")
+        + "}}\n\n"
+    )
+
+
+def _user_message_nack(
+    message_id: str, *, reason: str, retryable: bool
+) -> str:
+    return (
+        'data: {"type":"data-user-message-nack","id":'
+        + json.dumps(message_id, ensure_ascii=False)
+        + ',"data":{"reason":'
+        + json.dumps(reason)
+        + ',"retryable":'
+        + ("true" if retryable else "false")
+        + "}}\n\n"
+    )
 
 
 def _rewrite_outgoing_chunk(
@@ -140,6 +308,37 @@ def _rewrite_outgoing_chunk(
     return "data: " + json.dumps(payload, ensure_ascii=False) + "\n\n"
 
 
+def _turn_called_tool(tool_parts: dict[str, dict], tool_name: str) -> bool:
+    """True when this completed turn contains a tool-call with this final name."""
+    for part in tool_parts.values():
+        if not isinstance(part, dict) or part.get("kind") != "tool-call":
+            continue
+        name = str(part.get("name") or "").rsplit("__", 1)[-1]
+        if name == tool_name:
+            return True
+    return False
+
+
+def _should_skip_mention_chain(
+    *,
+    suppress_dispatch: bool,
+    burst_task_id: str | None,
+    turn_presented: bool,
+    turn_dispatched: bool,
+    turn_discussed: bool,
+    burst_started: bool,
+) -> bool:
+    """Treat post-turn @mentions as prose after terminal/orchestration actions."""
+    return (
+        suppress_dispatch
+        or burst_task_id is not None
+        or turn_presented
+        or turn_dispatched
+        or turn_discussed
+        or burst_started
+    )
+
+
 @ws_router.websocket("/ws/conv/{conv_id}")
 async def ws_conv(websocket: WebSocket, conv_id: str):
     """Per-conversation WebSocket with concurrent multi-agent support.
@@ -155,9 +354,9 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
 
     Concurrency model:
       - **Per-agent task slot**: each agent has its own `asyncio.Task`. Multiple
-        agents run *truly concurrently* for the same conv. The receive loop is
-        non-blocking so users can send new messages or abort while agents are
-        still streaming.
+        agents run *truly concurrently* for the same conv. The receive loop awaits
+        only the short durable-ingress + turn-registration section; it never awaits
+        model output, so new messages and aborts remain available while agents run.
       - **Single sender coroutine** drains a shared queue and writes to the
         WebSocket. This avoids interleaved partial frames and works around the
         fact that ``WebSocket.send_text`` is not safe for concurrent callers.
@@ -212,6 +411,10 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
         # raises — broadcast timing untouched; see api/event_log.py).
         event_log.tap(conv_id, chunk)
         await _broadcast_to_conv(conv_id, chunk)
+
+    async def emit_receipt(chunk: str) -> None:
+        """Queue an ACK/NACK only on the socket that submitted the message."""
+        await send_queue.put(chunk)
 
     # ── Conv-scoped execution state (module-level, survives this connection) ──
     # agent_id → asyncio.Task running adapter_events_to_chunks(...)
@@ -1214,22 +1417,60 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
             # incrementally (durable mid-stream) via _persist_tool_part; the
             # turn-end / abort persist UPSERTS the same ids (no dup rows).
             tool_parts: dict[str, dict] = {}
+            _tool_emit_lock = None
 
-            async def _persist_tool_part(mid: str, payload: dict | None) -> None:
+            def _release_tool_emit_lock() -> None:
+                nonlocal _tool_emit_lock
+                lock = _tool_emit_lock
+                if lock is None:
+                    return
+                _tool_emit_lock = None
+                lock.release()
+                _maybe_prune_conv(conv_id)
+
+            async def _persist_tool_part(
+                mid: str, payload: dict | None
+            ) -> bool | None:
                 """Persist/delete one streamed tool-call/diff part immediately.
 
                 ``payload is None`` means a temporary live card (successful
-                write/edit) has been superseded by its durable diff card.
+                write/edit) has been superseded by its durable diff card. A
+                tool-call transition retains the shared lock until its matching
+                chunk has been emitted; returning false tells the tap to suppress
+                a rejected late nonterminal frame.
                 """
-                async with SessionLocal() as _tdb:
-                    if payload is None:
-                        await storage_repo.delete_message(_tdb, mid)
-                    else:
-                        await storage_repo.upsert_message(
-                            _tdb, conv_id=conv_id, sender_id=agent_id,
-                            payload=_stamp_turn(payload), msg_id=mid,
-                        )
-                    await _tdb.commit()
+                nonlocal _tool_emit_lock
+                stamped = _stamp_turn(payload) if payload is not None else None
+                if stamped is None or stamped.get("kind") != "tool-call":
+                    await _persist_streamed_tool_part(
+                        conv_id=conv_id,
+                        sender_id=agent_id,
+                        msg_id=mid,
+                        payload=stamped,
+                    )
+                    return None
+
+                if _tool_emit_lock is not None:
+                    raise RuntimeError("previous tool transition was not emitted")
+                lock = RUNTIME.user_message_lock(conv_id)
+                await lock.acquire()
+                try:
+                    applied = await _write_streamed_tool_part(
+                        conv_id=conv_id,
+                        sender_id=agent_id,
+                        msg_id=mid,
+                        payload=stamped,
+                    )
+                except BaseException:
+                    lock.release()
+                    _maybe_prune_conv(conv_id)
+                    raise
+                if not applied:
+                    lock.release()
+                    _maybe_prune_conv(conv_id)
+                    return False
+                _tool_emit_lock = lock
+                return True
 
             emitted_any = False
             # An adapter can stream a TERMINAL error (e.g. a 401/429/500 surfaces
@@ -1245,6 +1486,22 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
             # or you @'d a sub-agent whose mention didn't resolve → fell back to
             # the orchestrator) must STILL drain, else its writes never reach main.
             _burst_started = False
+            # Set at turn-end if the reply leaked tool-call markup (a failed tool
+            # call); inited here so the stuck-orchestrator guard never NameErrors on
+            # an early-return path that skips the turn-end strip.
+            _had_orphan_leak = False
+            # Blocking-ask snapshot: which asks were ALREADY open before this turn
+            # ran. A blocking `ask_user` raised DURING this turn that appears here
+            # later means a NEW one. claude blocks in-process at ask_user (its stream
+            # pauses, the turn doesn't end until answered), so claude never trips the
+            # checks below. opencode fires ask_user in PARALLEL with work tools and
+            # doesn't await it — it keeps streaming + ends the turn with the ask still
+            # open. We catch that to (a) stop the runaway mid-stream and (b) orphan
+            # the ask at turn-end so the user's answer re-triggers a fresh turn.
+            _asks_at_start = open_ask_ids(conv_id)
+            # Set when we break the loop because the agent kept going past a blocking
+            # ask it just raised (so turn-end knows to orphan + skip the dead-turn guard).
+            _broke_on_open_ask = False
             # Failure paths (exception / abort) re-raise or `return` BEFORE the
             # clean-path persist further down — so without this they'd drop the
             # work trace (tool calls + partial reply) the agent already produced,
@@ -1259,11 +1516,14 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                 if _trace_flushed:
                     return
                 _trace_flushed = True
-                partial = "".join(response_buffer).strip()
+                partial = _strip_orphan_tool_tags("".join(response_buffer).strip())
                 if not tool_parts and not partial:
                     return
                 with suppress(Exception):
-                    async with SessionLocal() as _pdb:
+                    async with (
+                        RUNTIME.user_message_lock(conv_id),
+                        SessionLocal() as _pdb,
+                    ):
                         for _mid, _p in tool_parts.items():
                             # Turn died (abort/error) → any still-running tool is
                             # now error, never a frozen 进行中 on reload.
@@ -1327,6 +1587,17 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                     "429", "401", "被限速", "配额", "rate", "quota", "RPS",
                     "凭证", "overloaded", "529", "logged in", "/login",
                 )
+                # ...but a CLI with NO credential at all surfaces as
+                # "Not logged in · Please run /login" — it matches the markers
+                # above yet is TERMINAL: a respawn-retry can't conjure missing
+                # creds (an expired/refreshable token instead arrives as a
+                # 401/凭证 and IS worth retrying). Without this guard the
+                # unauthenticated case burns the whole _RETRY_BACKOFF (~230s)
+                # before the real error reaches the user — the opposite of
+                # surfacing it promptly. These substrings are absent from the
+                # retryable 401 text ("...凭证失效,请重新登录 claude /login"),
+                # so genuine 401s still retry.
+                _TERMINAL_AUTH_MARKERS = ("not logged in", "please run /login")
 
                 for attempt in range(_TURN_RETRIES + 1):
                     # Later attempts wait longer for first output (a slow model
@@ -1389,6 +1660,10 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                         # alive across idle windows.
                         anext_task = None
                         while True:
+                            # A persisted tool transition keeps the shared lock
+                            # until its exact outbound chunk has completed emit.
+                            # Release before waiting for any later model event.
+                            _release_tool_emit_lock()
                             if anext_task is None:
                                 anext_task = asyncio.ensure_future(agen.__anext__())
                             # Cold start (nothing streamed yet) → short window so a
@@ -1475,6 +1750,23 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                             if not emitted_any:
                                 await _clear_retry_notice()
                             emitted_any = True
+                            # A NEW blocking ask appeared mid-stream on a NON-dispatcher,
+                            # non-burst turn (a DM / direct agent): the agent (opencode)
+                            # fired ask_user but kept streaming work tools instead of
+                            # awaiting it. Stop the runaway — break to turn-end, which
+                            # orphans the ask so the user's answer re-triggers a fresh
+                            # turn. claude never reaches here (it pauses IN ask_user,
+                            # emitting no chunks while the ask is open); dispatcher /
+                            # burst turns are excluded so a worker's ask can't cut the
+                            # orchestrator's stream.
+                            if (
+                                not is_dispatcher
+                                and burst_task_id is None
+                                and _conv_has_open_ask(conv_id)
+                                and (open_ask_ids(conv_id) - _asks_at_start)
+                            ):
+                                _broke_on_open_ask = True
+                                break
                             # A terminal error chunk (from a TurnFailedEvent —
                             # 401/429/upstream) means this turn FAILED even though
                             # the stream ends "normally". Flag it so we don't mark
@@ -1491,6 +1783,10 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                                     not produced
                                     and attempt < _TURN_RETRIES
                                     and any(s in _etxt for s in _RATE_MARKERS)
+                                    and not any(
+                                        m in _etxt.lower()
+                                        for m in _TERMINAL_AUTH_MARKERS
+                                    )
                                 ):
                                     raise _RetryableUpstream(_etxt)
                                 turn_failed = True
@@ -1541,6 +1837,7 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                             ):
                                 produced = True
                             await emit(chunk)
+                        _release_tool_emit_lock()
                         await emit_agent_status(agent_id, "idle")
                         _live_clear_agent(conv_id, agent_id)
                         # A stream that ended cleanly but produced ZERO chunks is
@@ -1557,8 +1854,10 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                         await _clear_retry_notice()  # real response arrived → drop it
                         break  # success
                     except asyncio.CancelledError:
+                        _release_tool_emit_lock()
                         raise
                     except _RetryableUpstream as _rl_exc:
+                        _release_tool_emit_lock()
                         # Upstream rate-limit / transient overload (429 / quota /
                         # 凭证). The Anthropic Max ROLLING window recovers shortly →
                         # back off + retry the whole turn. No real output streamed
@@ -1598,6 +1897,7 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                         turn_failed = True
                         break
                     except Exception:
+                        _release_tool_emit_lock()
                         # Hung backend (incl. the idle-timeout RuntimeError) with
                         # NOTHING streamed yet → auto-retry up to _TURN_RETRIES with
                         # INCREASING backoff, and SHOW each retry to the user from
@@ -1633,6 +1933,7 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                         await _clear_retry_notice()  # giving up → drop the notice;
                         raise  # the outer handler emits the real (persisted) error
             except asyncio.CancelledError:
+                _release_tool_emit_lock()
                 await _clear_retry_notice()  # aborted mid-retry → drop the notice
                 # Cancel cleanup needs THREE steps — interrupt was wrong on its own:
                 #   1. signal the live CLI subprocess to stop (interrupt)
@@ -1683,6 +1984,7 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                     _pending_dispatches.pop(conv_id, None)
                 raise
             except Exception as exc:
+                _release_tool_emit_lock()
                 await emit_agent_status(agent_id, "error", {"message": str(exc)})
                 _live_clear_agent(conv_id, agent_id)
                 # Same cleanup as the abort path: any pending-edit rows this
@@ -1779,6 +2081,15 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
             # renders in the thread. Only for a real orchestrator turn (not a
             # suppressed summary, not a burst worker).
             full_text, _leaked_dispatch = _recover_leaked_dispatch(full_text)
+            # Sweep any leftover orphan protocol tags (a lone </parameter>, dangling
+            # <invoke>, antml:-namespaced variants) the structured recoveries above
+            # don't catch — observed: opus leaking a trailing </parameter> after an
+            # ask_user call, which rendered as visible text.
+            _pre_orphan = full_text
+            full_text = _strip_orphan_tool_tags(full_text)
+            # The model wrote leaked tool-call markup (orphan tags) into its text —
+            # a sign it ATTEMPTED a tool call that didn't parse as a native one.
+            _had_orphan_leak = full_text != _pre_orphan
             if (
                 _leaked_dispatch is not None
                 and not suppress_dispatch
@@ -1806,7 +2117,10 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
             # live-only + persisted after the card → wrong order.)
             _persisted_text_msg_id: str | None = None
             if tool_parts or full_text:
-                async with SessionLocal() as _persist_db:
+                async with (
+                    RUNTIME.user_message_lock(conv_id),
+                    SessionLocal() as _persist_db,
+                ):
                     _coerced_frames: list[str] = []
                     for _mid, p in tool_parts.items():
                         # Don't persist EMPTY reasoning rows (some adapters emit a
@@ -2214,7 +2528,10 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                     # point at the live blackboard. The orchestrator reads these
                     # back to verify the burst instead of trusting silence.
                     worker_text += (
-                        "\n\n# 收尾(必须)\n"
+                        "\n\n# 动手(别空转)\n"
+                        "说了要写 / 要改就**在同一轮立刻调用真实 `write` / `edit` / `bash` 工具**做出来;"
+                        "别反复说\"我去落盘 / 我现在写 / 接下来写\"却一个工具都不发——本轮只说不做 = 交付失败、产物为空。\n"
+                        "# 收尾(必须)\n"
                         "完成后调用 `report` 工具自评交付:status(ok/partial/failed)、"
                         "deliverables(产物文件名+一句话)、contract_ok(是否符合上面的契约)。"
                         "这是你向 Orchestrator 的正式交付确认——没有它,你的产物按\"未验证\"对待。\n"
@@ -2408,7 +2725,7 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
             # Now that `mentioned` holds RESOLVED agent_ids (template OR
             # custom), accept any agent that has an adapter routing.
             #
-            # Three cases skip chaining entirely:
+            # These cases skip chaining entirely:
             #   · suppress_dispatch — terminal summary turn; a wrap-up that
             #     @mentions someone must not re-trigger them.
             #   · burst_task_id — this is a dispatched burst WORKER. Workers
@@ -2424,16 +2741,69 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
             #     off an ack relay AFTER the files card already landed (observed
             #     live). Genuine next-phase work goes through `dispatch`, never a
             #     bare @mention, so a present turn never needs to chain.
-            _turn_presented = any(
-                isinstance(p, dict)
-                and p.get("kind") == "tool-call"
-                and (p.get("name") or "").rsplit("__", 1)[-1] == "present"
-                for p in tool_parts.values()
+            #   · dispatch/discuss — the orchestration tool already owns the next
+            #     steps. Any teammate names in the same explanatory text are prose;
+            #     auto-promoting them into a free-form discussion creates a spurious
+            #     `讨论结论` card after ordinary delivery workflows.
+            _turn_presented = _turn_called_tool(tool_parts, "present")
+            _turn_dispatched = _turn_called_tool(tool_parts, "dispatch")
+            _turn_discussed = _turn_called_tool(tool_parts, "discuss") or bool(
+                _disc_batches
             )
-            _skip_chain = (
-                suppress_dispatch
-                or burst_task_id is not None
-                or _turn_presented
+            # Abandoned-blocking-ask recovery: this turn ENDED while a blocking
+            # ask_user it raised is STILL open (opencode fires the ask but runs it in
+            # parallel with work tools and never awaits it, so the turn finishes
+            # without the answer — claude can't reach here, it blocks IN ask_user
+            # until answered). Orphan that ask so the user's reply is treated as
+            # ORPHANED → the client re-triggers a fresh turn WITH the answer (the
+            # suspend-and-restart path), instead of the agent having barreled ahead
+            # on assumptions. Scoped to non-dispatcher, non-burst turns so a worker's
+            # mid-burst ask never orphans the orchestrator's. `keep=_asks_at_start`
+            # leaves any pre-existing ask untouched — only THIS turn's new one drops.
+            if not is_dispatcher and burst_task_id is None:
+                _orphaned_asks = orphan_conv_asks(conv_id, keep=_asks_at_start)
+                if _orphaned_asks:
+                    log.info(
+                        "abandoned blocking ask(s) orphaned for fresh re-trigger: "
+                        "conv=%s agent=%s ids=%s broke_mid_stream=%s",
+                        conv_id, agent_id, _orphaned_asks, _broke_on_open_ask,
+                    )
+            # Stuck-orchestrator guard: the model emitted leaked tool-call markup
+            # (orphan tags we stripped) yet completed NO real action — no dispatch,
+            # no ask_user registered, no present/discuss, no burst. It "promised" a
+            # form/dispatch and silently took none, leaving the conv dead (observed:
+            # orchestrator wrote 「我用表单问你」 then a stray </parameter>, no form
+            # ever appeared). Surface a RETRYABLE error so the user isn't stuck on a
+            # silent dead turn (a fresh re-trigger reliably succeeds). Additive — does
+            # NOT touch the dispatch/mention-chain flow below.
+            if (
+                _had_orphan_leak
+                and is_dispatcher
+                and not (
+                    _turn_dispatched
+                    or _turn_presented
+                    or _turn_discussed
+                    or _burst_started
+                )
+                and not _conv_has_open_ask(conv_id)
+            ):
+                with suppress(Exception):
+                    await _persist_and_emit_error(
+                        emit, conv_id=conv_id, sender_id=agent_id,
+                        message=(
+                            "协调者的工具调用格式出错(把工具协议写进了正文),"
+                            "这一轮没能生成表单 / 派活,没有生效。再发一条消息让它重试即可。"
+                        ),
+                        reason="malformed_tool_call",
+                        retryable=True,
+                    )
+            _skip_chain = _should_skip_mention_chain(
+                suppress_dispatch=suppress_dispatch,
+                burst_task_id=burst_task_id,
+                turn_presented=_turn_presented,
+                turn_dispatched=_turn_dispatched,
+                turn_discussed=_turn_discussed,
+                burst_started=_burst_started,
             )
             _raw_targets = [] if _skip_chain else mentioned
             # Inside an explicit discussion, @existing-participant is a
@@ -2648,10 +3018,49 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                                     drain, source_agent=agent_id
                                 )
 
+    async def persist_user_message(
+        text: str,
+        in_reply_to: str | None,
+        msg_id: str | None,
+        code_sha: str | None,
+    ) -> tuple[str, bool, dict]:
+        """Durably append one ordinary user message without doing any routing."""
+        user_payload = {"kind": "text", "body": [{"t": "p", "c": text}]}
+
+        async def append_attempt() -> tuple[str, bool]:
+            async with SessionLocal() as db:
+                mid, inserted = await storage_repo.append_message_once(
+                    db,
+                    conv_id=conv_id,
+                    sender_id="you",
+                    payload=user_payload,
+                    in_reply_to=in_reply_to,
+                    code_sha=code_sha,
+                    msg_id=msg_id,
+                )
+                if inserted:
+                    # A draft-clear hiccup must not block durable user append.
+                    with suppress(Exception):
+                        await storage_repo.set_draft_text(db, conv_id, "")
+                    await db.commit()
+                return mid, inserted
+
+        try:
+            mid, inserted = await append_attempt()
+        except IntegrityError:
+            if msg_id is None:
+                raise
+            # A concurrent unique-id winner may have committed after our initial
+            # lookup. The failed session has exited/rolled back; classify against
+            # the winner from a fresh session.
+            mid, inserted = await append_attempt()
+        return mid, inserted, user_payload
+
     async def dispatch_user_message(
-        text: str, members: list[str], in_reply_to: str | None = None,
-        msg_id: str | None = None,
-        persist_user: bool = True,
+        text: str,
+        members: list[str],
+        in_reply_to: str | None = None,
+        persisted_user_id: str | None = None,
         regenerate_msg_id: str | None = None,
         regenerate_sender_id: str | None = None,
     ) -> None:
@@ -2679,48 +3088,6 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
             conv = await storage_repo.get_conversation(session, conv_id)
         orch_id = conv.orchestrator_member_id if conv else None
         use_orch = bool(orch_id and orch_id in members)
-
-        # Persist the user's message FIRST so it shows up after a refresh and so
-        # the L4 history layer (which reads MessageRow) sees this turn.
-        # Without this, both the frontend lazy-load and the context assembler
-        # think the conv is empty.
-        persisted_user_id: str | None = None
-        if persist_user and text.strip():
-            user_payload = {"kind": "text", "body": [{"t": "p", "c": text}]}
-            # Stamp the code checkpoint: workspace main HEAD *before* this turn's
-            # work, so「回到这个对话」on this message restores to that point.
-            code_sha = await _workspace_head_for_conv(conv_id)
-            # `msg_id` (when provided by the client over WS) lets the optimistic
-            # store and the persisted row share one identity — required so that
-            # 「从此处重来」/ reply / pin on this freshly-sent message resolves
-            # the row instead of 404'ing on the client's `u-<uuid>` placeholder.
-            async with SessionLocal() as db:
-                uid = await storage_repo.append_message(
-                    db, conv_id=conv_id, sender_id="you", payload=user_payload,
-                    in_reply_to=in_reply_to, code_sha=code_sha, msg_id=msg_id,
-                )
-                persisted_user_id = uid
-                # The draft is now SENT → clear it so it stops lingering in the
-                # composer. The UI clears its local input optimistically, but the
-                # persisted conv.draft_text is only cleared here — so WS-sent
-                # messages (and pre-seeded drafts) don't leave the just-sent text
-                # sitting in the box on reload / on other live clients. Suppressed:
-                # a draft-clear hiccup must never block the send.
-                with suppress(Exception):
-                    await storage_repo.set_draft_text(db, conv_id, "")
-                await db.commit()
-            # Real-time multi-client sync: echo the human message to OTHER clients
-            # tailing this conv (e.g. desktop + web both open on the same group),
-            # so the bubble appears live instead of only after a refresh. The
-            # sending client already rendered it optimistically under the SAME id
-            # (msg_id), so an id-keyed store dedups its own echo. Additive +
-            # suppress-guarded — never breaks the dispatch path below.
-            with suppress(Exception):
-                echo = encode_polynoia_card(
-                    "text", user_payload, msg_id or uid,
-                    sender_id="you", sender_label="你",
-                )
-                await _broadcast_to_conv(conv_id, echo)
 
         # Groups MUST have an orchestrator (enforced at creation, ~912). Defense
         # in depth: if a group ever reaches dispatch without a usable orchestrator
@@ -2918,6 +3285,11 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                     'data: {"type":"error","error_text":"invalid json"}\n\n'
                 )
                 continue
+            if not isinstance(msg, dict):
+                await emit(
+                    'data: {"type":"error","error_text":"invalid message"}\n\n'
+                )
+                continue
 
             kind = msg.get("kind")
 
@@ -2960,38 +3332,161 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
                 continue
 
             if kind == "user_message":
-                text: str = msg.get("text", "")
-                members: list[str] = msg.get("members", [])
-                in_reply_to: str | None = msg.get("in_reply_to") or None
+                raw_text = msg.get("text")
+                raw_members = msg.get("members", [])
+                raw_reply_to = msg.get("in_reply_to")
                 # Optional client-pre-allocated id — keeps the optimistic store
                 # entry and the DB row sharing one identity; without it rewind /
                 # reply / pin on freshly-sent messages 404 until next refresh.
-                client_msg_id: str | None = (msg.get("msg_id") or None)
+                raw_client_msg_id = msg.get("msg_id")
+                has_client_msg_id = "msg_id" in msg
                 regenerate = bool(msg.get("regenerate"))
-                regenerate_msg_id: str | None = (msg.get("regenerate_msg_id") or None)
-                regenerate_sender_id: str | None = (
-                    msg.get("regenerate_sender_id") or None
+                receipt_id = (
+                    raw_client_msg_id
+                    if isinstance(raw_client_msg_id, str)
+                    else ""
                 )
-                # Don't await — dispatch returns when fan-out is queued, the
-                # actual streams continue in the background. Tracked conv-scoped
-                # (not just locally) so it isn't GC'd AND so the disconnect-prune
-                # won't free this conv's dicts while the dispatcher is still in
-                # its pre-registration await window (else it'd orphan the
-                # agent_tasks dict the dispatcher then writes into).
-                _spawn_dispatcher(
-                    conv_id,
-                    dispatch_user_message(
-                        text,
-                        members,
-                        in_reply_to,
-                        msg_id=client_msg_id,
-                        persist_user=not regenerate,
-                        regenerate_msg_id=regenerate_msg_id if regenerate else None,
-                        regenerate_sender_id=(
-                            regenerate_sender_id if regenerate else None
+                valid_fields = (
+                    isinstance(raw_text, str)
+                    and isinstance(raw_members, list)
+                    and all(isinstance(member, str) for member in raw_members)
+                    and (
+                        raw_reply_to is None
+                        or (
+                            isinstance(raw_reply_to, str)
+                            and len(raw_reply_to) <= MESSAGE_ID_MAX_LENGTH
+                        )
+                    )
+                )
+                valid_message_id = (
+                    not has_client_msg_id
+                    or (
+                        isinstance(raw_client_msg_id, str)
+                        and bool(raw_client_msg_id.strip())
+                        and len(raw_client_msg_id) <= MESSAGE_ID_MAX_LENGTH
+                    )
+                )
+                valid_text = isinstance(raw_text, str) and bool(raw_text.strip())
+                if (
+                    not valid_fields
+                    or (not regenerate and not valid_message_id)
+                    or (not regenerate and not valid_text)
+                ):
+                    await emit_receipt(
+                        _user_message_nack(
+                            receipt_id,
+                            reason="invalid_message",
+                            retryable=False,
+                        )
+                    )
+                    continue
+
+                text = cast(str, raw_text)
+                members = cast(list[str], raw_members)
+                in_reply_to = cast(str | None, raw_reply_to or None)
+                client_msg_id = cast(str | None, raw_client_msg_id)
+                regenerate_msg_id = msg.get("regenerate_msg_id") or None
+                regenerate_sender_id = msg.get("regenerate_sender_id") or None
+
+                if regenerate:
+                    # Regeneration has no new user row or delivery receipt. Keep it
+                    # outside the ordinary ingress lock/outbox protocol.
+                    _spawn_dispatcher(
+                        conv_id,
+                        dispatch_user_message(
+                            text,
+                            members,
+                            in_reply_to,
+                            regenerate_msg_id=regenerate_msg_id,
+                            regenerate_sender_id=regenerate_sender_id,
                         ),
-                    ),
-                )
+                    )
+                    continue
+
+                # The critical section ends once routing has registered existing
+                # background turns; it never awaits model output. Checkpoint lookup
+                # stays inside this ordered ingress section: it has a hard 250 ms
+                # budget and per-conv single-flight, so later frames do not stack
+                # waits, while an earlier frame can never be persisted/routed after
+                # a later frame from another socket.
+                async with RUNTIME.user_message_lock(conv_id):
+                    code_sha = await _bounded_workspace_head_for_conv(conv_id)
+                    try:
+                        mid, inserted, user_payload = await persist_user_message(
+                            text,
+                            in_reply_to,
+                            client_msg_id,
+                            code_sha,
+                        )
+                    except storage_repo.MessageIdConflictError:
+                        await emit_receipt(
+                            _user_message_nack(
+                                receipt_id,
+                                reason="message_id_conflict",
+                                retryable=False,
+                            )
+                        )
+                        continue
+                    except Exception:
+                        log.exception(
+                            "user message persistence failed: conv=%s id=%s",
+                            conv_id,
+                            receipt_id,
+                        )
+                        await emit_receipt(
+                            _user_message_nack(
+                                receipt_id,
+                                reason="persistence_error",
+                                retryable=True,
+                            )
+                        )
+                        # Do not let later frames on this physical socket cross a
+                        # retryable gap. Returning drains the queued NACK before
+                        # the sender sentinel; the replacement then replays the
+                        # client's ordered outbox from this failed entry.
+                        break
+
+                    await emit_receipt(
+                        _user_message_ack(mid, duplicate=not inserted)
+                    )
+                    if not inserted:
+                        continue
+
+                    # Echo only newly inserted rows. Exact replay is receipt-only.
+                    with suppress(Exception):
+                        echo = encode_polynoia_card(
+                            "text",
+                            user_payload,
+                            mid,
+                            sender_id="you",
+                            sender_label="你",
+                            in_reply_to=in_reply_to,
+                        )
+                        await _broadcast_to_conv(conv_id, echo)
+
+                    try:
+                        await dispatch_user_message(
+                            text,
+                            members,
+                            in_reply_to,
+                            persisted_user_id=mid,
+                        )
+                    except Exception:
+                        # The durable ACK is final: routing failures become the
+                        # existing persisted error card, never a contradictory NACK.
+                        log.exception(
+                            "user message routing failed after commit: conv=%s id=%s",
+                            conv_id,
+                            mid,
+                        )
+                        await _persist_and_emit_error(
+                            emit,
+                            conv_id=conv_id,
+                            sender_id="system",
+                            message="消息已保存, 但后续处理启动失败。请稍后重试。",
+                            reason="exception",
+                            retryable=True,
+                        )
                 continue
 
             # Unknown kind — ignore but log via error chunk
@@ -3003,6 +3498,12 @@ async def ws_conv(websocket: WebSocket, conv_id: str):
 
     except WebSocketDisconnect:
         pass
+    except RuntimeError as exc:
+        # Starlette can surface an abrupt transport abort as RuntimeError rather
+        # than WebSocketDisconnect. Accept only its exact lifecycle messages;
+        # unrelated RuntimeErrors remain visible instead of being swallowed.
+        if str(exc) not in _STARLETTE_DISCONNECT_RUNTIME_ERRORS:
+            raise
     finally:
         # Backend-driven execution: a disconnect/refresh does NOT cancel agent
         # tasks. They keep running (conv-scoped, module-level) and persist their

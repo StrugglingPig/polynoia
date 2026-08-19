@@ -18,6 +18,50 @@ import asyncio
 from dataclasses import dataclass, field
 
 
+class ConversationIngressLock:
+    """An asyncio lock whose active holder/waiter lifetime is observable.
+
+    ``asyncio.Lock.locked()`` is briefly false during owner-to-waiter handoff.
+    Runtime pruning needs the stronger ``in_use`` signal so it cannot replace the
+    shared conversation lock in that window. Counts are maintained without
+    inspecting asyncio private fields.
+    """
+
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._holders = 0
+        self._waiters = 0
+
+    @property
+    def in_use(self) -> bool:
+        return self._holders > 0 or self._waiters > 0
+
+    def locked(self) -> bool:
+        return self._lock.locked()
+
+    async def acquire(self) -> bool:
+        self._waiters += 1
+        try:
+            await self._lock.acquire()
+        except BaseException:
+            self._waiters -= 1
+            raise
+        self._waiters -= 1
+        self._holders += 1
+        return True
+
+    def release(self) -> None:
+        self._lock.release()
+        self._holders -= 1
+
+    async def __aenter__(self) -> ConversationIngressLock:
+        await self.acquire()
+        return self
+
+    async def __aexit__(self, *_args) -> None:
+        self.release()
+
+
 @dataclass
 class ConversationRuntime:
     """Owns all conv-scoped execution dicts. One process-wide singleton (RUNTIME).
@@ -38,6 +82,7 @@ class ConversationRuntime:
       inflight          ← _conv_inflight        conv_id → {live turn tasks} (strong refs)
       tool_activity     ← _conv_tool_activity   conv_id → loop.time() of last terminal activity
       dispatchers       ← _conv_dispatchers     conv_id → {dispatcher tasks}
+      user_message_locks                        conv_id → ingress Lock
       live              ← _conv_live            conv_id → agent_id → live-stream accumulator
     """
 
@@ -56,7 +101,12 @@ class ConversationRuntime:
     inflight: dict[str, set[asyncio.Task]] = field(default_factory=dict)
     tool_activity: dict[str, float] = field(default_factory=dict)
     dispatchers: dict[str, set[asyncio.Task]] = field(default_factory=dict)
+    user_message_locks: dict[str, ConversationIngressLock] = field(default_factory=dict)
     live: dict[str, dict[str, dict]] = field(default_factory=dict)
+
+    def user_message_lock(self, conv_id: str) -> ConversationIngressLock:
+        """Serialize durable user-message ingress for one conversation."""
+        return self.user_message_locks.setdefault(conv_id, ConversationIngressLock())
 
     def conv_has_open_ask(self, conv_id: str) -> bool:
         """True while this conv has an ask_user awaiting the user's answer (value
@@ -77,6 +127,9 @@ class ConversationRuntime:
             return
         if self.dispatchers.get(conv_id):
             return
+        ingress_lock = self.user_message_locks.get(conv_id)
+        if ingress_lock is not None and ingress_lock.in_use:
+            return
         if conv_id in self.outboxes:
             return
         self.agent_tasks.pop(conv_id, None)
@@ -85,6 +138,7 @@ class ConversationRuntime:
         self.bursts.pop(conv_id, None)
         self.inflight.pop(conv_id, None)
         self.dispatchers.pop(conv_id, None)
+        self.user_message_locks.pop(conv_id, None)
         self.pending_dispatches.pop(conv_id, None)
         self.discussions.pop(conv_id, None)
         self.pending_discussions.pop(conv_id, None)

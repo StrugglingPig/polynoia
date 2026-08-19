@@ -242,3 +242,48 @@ def test_direct_builder_can_present_but_group_member_cannot():
     assert "write" in group_member
     assert "bash" in group_member
     assert "dispatch" not in group_member
+
+
+def test_is_concurrent_safe_surfaces_as_readonly_hint() -> None:
+    """Each tool's is_concurrent_safe must surface as MCP annotations.readOnlyHint.
+    The claude_agent_sdk runs read-only MCP tools CONCURRENTLY and serializes the
+    rest, so this one flag gives claude isConcurrentSafe batching (keeps Pro login).
+    Read-only/idempotent tools are safe; anything that mutates state is a barrier.
+    """
+    SAFE = {"read", "grep", "glob", "recall", "wait"}
+    for name, tool in TOOL_REGISTRY.items():
+        hint = tool.spec().annotations.readOnlyHint
+        assert hint == tool.is_concurrent_safe, f"{name}: spec hint != flag"
+        assert hint is (name in SAFE), (
+            f"{name}: is_concurrent_safe={hint}, expected {name in SAFE}"
+        )
+    # The mutating tools must NOT be marked safe (they'd run concurrently + clobber).
+    for unsafe in ("write", "edit", "bash", "dispatch", "ask_user", "remember"):
+        assert TOOL_REGISTRY[unsafe].is_concurrent_safe is False
+
+
+@pytest.mark.asyncio
+async def test_large_result_spills_to_file(ctx) -> None:
+    """An oversized SUCCESS result is written to a workspace file + replaced by a
+    compact pointer; small results and errors are returned inline unchanged."""
+    import json as _json
+
+    from polynoia.mcp.server import _MAX_RESULT_BYTES, _maybe_spill_large_result
+
+    big = {"kind": "file", "content": "x" * (_MAX_RESULT_BYTES + 2000)}
+    out = _maybe_spill_large_result(big, ctx, "read")
+    assert out["kind"] == "result_spilled"
+    assert out["bytes"] > _MAX_RESULT_BYTES
+    assert out["file"].startswith(".polynoia/tool-results/")
+    assert 0 < len(out["preview"]) <= 1500
+    assert "read(" in out["hint"]
+    # the spilled file holds the FULL result, readable back
+    spilled = ctx.sandbox.root / out["file"]
+    assert spilled.exists()
+    assert _json.loads(spilled.read_text())["content"] == big["content"]
+    # small result → unchanged (same object)
+    small = {"kind": "file", "content": "hi"}
+    assert _maybe_spill_large_result(small, ctx, "read") is small
+    # error / timeout → never spilled (must stay inline + visible)
+    err = {"kind": "error", "error": "y" * (_MAX_RESULT_BYTES + 2000)}
+    assert _maybe_spill_large_result(err, ctx, "read") is err

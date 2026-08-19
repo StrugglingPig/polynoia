@@ -1,0 +1,128 @@
+name: Moderate issues and pull requests
+
+on:
+  issues:
+    types: [opened, edited, reopened]
+  pull_request_target:
+    types: [opened, edited, reopened, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+jobs:
+  moderate:
+    name: Delete or lock abusive reports
+    runs-on: ubuntu-latest
+    steps:
+      - name: Moderate issue or pull request
+        uses: actions/github-script@v7
+        env:
+          # PAT used ONLY for the hard-delete GraphQL call (deletion needs an
+          # admin token; the default GITHUB_TOKEN can't delete). Everything else
+          # (comment / close / lock) uses the default GITHUB_TOKEN below, so an
+          # absent/invalid PAT degrades gracefully to close+lock instead of
+          # breaking the whole run.
+          MOD_PAT: ${{ secrets.MODERATION_PAT }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const item = context.payload.issue || context.payload.pull_request;
+            if (!item) return;
+
+            const association = item.author_association || "";
+            const trusted = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
+            if (trusted.has(association)) {
+              core.info(`Trusted author association: ${association}; skipping.`);
+              return;
+            }
+
+            const title = item.title || "";
+            const body = item.body || "";
+            const text = `${title}\n${body}`.toLowerCase();
+
+            const hardBlock = [
+              /清违规人气/,
+              /违规人气.*清/,
+              /违规流量.*清/,
+              /项目.*(关闭|关停|下架)/,
+              /(举报|检举).*(github|平台|官方)/i,
+              /(github|平台|官方).*(举报|检举)/i,
+              /github.*(清|删|关).*(star|人气|项目|入口)/i,
+              /shut\s*down\s+(the\s+)?project/i,
+              /reported?\s+to\s+github/i,
+            ];
+
+            const signals = [
+              /假星/,
+              /虚假\s*star/i,
+              /刷星/,
+              /买星/,
+              /购买.*star/i,
+              /买.*虚假/,
+              /空壳号/,
+              /空号/,
+              /僵尸(号|粉|账号)/,
+              /stargazer\s+质量/i,
+              /star\s*数据.*异常/i,
+              /(可疑|疑似).*star/i,
+              /star.*(可疑|疑似|异常)/i,
+              /fake\s+stars?/i,
+              /bought\s+stars?/i,
+              /star\s+fraud/i,
+            ];
+
+            const hardHit = hardBlock.some((re) => re.test(text));
+            const signalCount = signals.filter((re) => re.test(text)).length;
+            if (!hardHit && signalCount < 2) {
+              core.info(`No moderation match. signalCount=${signalCount}`);
+              return;
+            }
+
+            const issue_number = item.number;
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const isIssue = !!context.payload.issue;
+            const kind = isIssue ? "issue" : "pull request";
+
+            // Issues: try a HARD DELETE with the admin PAT (GraphQL). PRs can't
+            // be deleted — they always fall through to close + lock.
+            if (isIssue && process.env.MOD_PAT) {
+              try {
+                const r = await fetch("https://api.github.com/graphql", {
+                  method: "POST",
+                  headers: {
+                    Authorization: `bearer ${process.env.MOD_PAT}`,
+                    "Content-Type": "application/json",
+                  },
+                  body: JSON.stringify({
+                    query: `mutation($id: ID!) { deleteIssue(input: { issueId: $id }) { repository { id } } }`,
+                    variables: { id: item.node_id },
+                  }),
+                });
+                const j = await r.json();
+                if (r.ok && j && !j.errors) {
+                  core.info(`Deleted issue #${issue_number}. hardHit=${hardHit} signalCount=${signalCount}`);
+                  return;
+                }
+                core.warning(`deleteIssue via PAT failed (${r.status}): ${JSON.stringify(j && j.errors)}. Falling back to close + lock.`);
+              } catch (e) {
+                core.warning(`deleteIssue error: ${e.message}. Falling back to close + lock.`);
+              }
+            } else if (isIssue) {
+              core.info("No MODERATION_PAT secret set — using close + lock (set an admin PAT to enable hard delete).");
+            }
+
+            // Fallback (delete unavailable) and all PRs: comment + close + lock,
+            // via the default GITHUB_TOKEN (always valid).
+            const comment = [
+              "This conversation was automatically closed and locked because it matches this repository's moderation policy for abusive, spam-like, or campaign-style reports.",
+              "",
+              "If this was a legitimate bug report or contribution, please contact the maintainers with a clear reproduction or patch.",
+            ].join("\n");
+
+            await github.rest.issues.createComment({ owner, repo, issue_number, body: comment });
+            await github.rest.issues.update({ owner, repo, issue_number, state: "closed", state_reason: "not_planned" });
+            await github.rest.issues.lock({ owner, repo, issue_number, lock_reason: "spam" });
+            core.info(`Closed and locked ${kind} #${issue_number}. hardHit=${hardHit} signalCount=${signalCount}`);

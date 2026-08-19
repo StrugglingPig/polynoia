@@ -77,11 +77,15 @@ _DISCIPLINE_COMMON = """# 工具使用纪律(平台规则,自动注入)
 
 你能用的工具,系统已经注入到这次请求里了 —— **不用自己背 / 列清单**,直接按各工具的 schema 调用。下面只讲规矩:
 
+- **别空转(说了就立刻做)**:说出「我去写 / 我现在写 / 接下来落盘 / 我来改 / 开始落盘」这类动作话术,就**在同一轮里立刻发出对应的真实工具调用**(`write` / `edit` / `bash` …)。反复声明意图却一个工具都不调 = 本轮零交付、产物为空(真实发生过:有成员从头到尾说“我去落盘 / 我现在写”却一次 `write` 都没发,两份文件根本没落)。正文只用来讲已完成的结论,**不要用来描述你“即将”做的动作**;要做的事直接用工具做出来。
 - 写文件**一律用 `write` 工具**(给出完整文件内容),落盘成功才算完成;别在没调之前说“已交付 / 已落盘”。**不要用 bash 的 `echo`/`cat`/`>`/heredoc 写文件**——那绕过审计、看不到 diff。(要程序化生成二进制产物时,用 `write` 写好生成脚本,再 `bash` 跑它。)你 CLI 自带的原生写文件通道(如 `apply_patch` / 编辑器直写)在本平台沙箱里是**只读被拒**的——别试,第一次写就直接用平台 `write`。
 - 报告完成前**必须**调一次 read 把刚写的内容读回来核对(工具 result 是真相,你的文字描述是辅助)。
 - 声称“测试通过 / 跑通”前**必须**真用 bash 跑一遍,贴真实输出 + exit_code 为证(没 bash 的角色不声称跑通)。
 - 给用户汇报讲人话:只说改了哪个文件、干了啥、怎么验证的;别贴 commit hash / git 命令 / 沙箱绝对路径。
 - **依赖装在本地工作目录,不要全局装**:Python 一律用 **uv**(`uv add <包>` / `uv run <命令>` / `uv pip install`),venv 就在工作目录的 `.venv`;Node 用本地 `node_modules`(`npm i` / `pnpm add`,**不要 `-g`)。`.venv` / `node_modules` 已被 gitignore,不会污染提交。
+- **安装源按用户网络环境选**:如果用户是中国大陆网络环境 / 背景,各种安装源优先考虑国内镜像以避免超时(如 PyPI 用 `https://pypi.tuna.tsinghua.edu.cn/simple`,npm 用 `https://registry.npmmirror.com`);否则用默认官方源。临时换源即可(`uv pip install -i <镜像>` / `npm i --registry <镜像>`),**不要把镜像写死进项目配置文件**。
+- **能并行就并行**:相互独立的工具调用**可以一次性一起发**,平台会并行执行。**只读工具(`read` / `grep` / `glob` / `recall` / `wait`)是并发安全的**——要查多个文件 / 多处定位时,一批发出去最快,别一个一个等结果。改状态的工具(`write` / `edit` / `bash` / `dispatch` 等)平台会**自动串行、互为屏障**(所以你不用担心并发写撞车;但把多个写堆一起也不会更快,按依赖顺序来即可)。
+- **工具结果过长**时平台会自动把完整结果**写进一个文件**、只回给你开头预览 + 路径;需要细看就用 `read(路径, offset, limit)` 分段读,或 `grep` 直接定位,别要求重发整坨。
 
 ## 几个特殊工具 —— 有就用,没有就忽略
 
@@ -171,14 +175,26 @@ def build_identity_layer(
     # ability — bound per-contact via the contact editor.
     skills = getattr(agent, "skills", None) or []
     if skills:
-        from polynoia.skills import read_skill_instructions
+        from polynoia.skills import (
+            native_skill_package_name,
+            read_skill_instructions,
+            supports_native_skills,
+        )
 
         parts.append("")
         parts.append("## 你已装配的技能")
         for s in skills:
             fallback = read_skill_instructions(s.name) or {}
             desc = s.description or fallback.get("description")
-            instructions = (s.instructions or "").strip() or fallback.get("instructions", "")
+            # Explicit per-contact overrides remain inline. Package instructions
+            # are otherwise left to native progressive disclosure; only future
+            # adapters or non-portable packages receive the full fallback.
+            native = supports_native_skills(adapter_id) and bool(
+                native_skill_package_name(s.name)
+            )
+            instructions = (s.instructions or "").strip()
+            if not instructions and not native:
+                instructions = fallback.get("instructions", "")
             parts.append(f"### {s.name}")
             if desc:
                 parts.append(f"_{desc}_")

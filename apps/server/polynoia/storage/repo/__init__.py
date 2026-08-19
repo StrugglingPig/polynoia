@@ -27,6 +27,7 @@ from polynoia.storage.repo.conflicts import (
 )
 from polynoia.storage.repo.conv_memory import (
     add_conv_memory,
+    delete_conv_memory_from,
     list_agent_memory,
     list_conv_memory,
     list_workspace_memory,
@@ -52,9 +53,13 @@ from polynoia.storage.repo.conversations import (
     set_workspace_id,
 )
 from polynoia.storage.repo.messages import (
+    MessageIdConflictError,
     append_message,
+    append_message_once,
     delete_message,
     delete_messages_from,
+    latest_message_previews,
+    latest_messages_for_convs,
     list_messages,
     list_pinned_messages,
     set_message_pinned,
@@ -110,12 +115,15 @@ from polynoia.storage.repo.workspaces import (
 )
 
 __all__ = [
+    "MessageIdConflictError",
     "abandon_pending_edits_for_adapter",
     "active_access_grant",
     "add_conv_memory",
+    "delete_conv_memory_from",
     "add_onboarded_adapter",
     "add_pin",
     "append_message",
+    "append_message_once",
     "clear_conversation_messages",
     "close_terminal_card_for_run",
     "create_conflict",
@@ -137,6 +145,8 @@ __all__ = [
     "has_waiting_pending_access",
     "has_waiting_pending_edits",
     "increment_unread",
+    "latest_message_previews",
+    "latest_messages_for_convs",
     "list_agent_memory",
     "list_agents",
     "list_conflicts",

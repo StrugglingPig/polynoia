@@ -65,6 +65,7 @@ type Props = {
 		adapter_id?: string;
 		name?: string;
 		system_prompt?: string;
+		tagline?: string;
 		color?: string;
 	} | null;
 };
@@ -88,6 +89,10 @@ export function NewContactModal({
 	);
 	const [model, setModel] = useState<string>(editing?.setup?.model ?? "");
 	const [customModel, setCustomModel] = useState(editing?.setup?.model ?? "");
+	const [apiKey, setApiKey] = useState("");
+	const [apiBaseUrl, setApiBaseUrl] = useState(
+		editing?.setup?.api_base_url ?? "",
+	);
 	// Context-window ceiling — required, chosen from presets (or 自定义). The
 	// dropdown value is the preset number as a string, or "custom"; customCtx
 	// holds the free-typed number when "custom". Seeds from the editing value:
@@ -110,6 +115,7 @@ export function NewContactModal({
 	const [systemPrompt, setSystemPrompt] = useState(
 		editing?.system_prompt ?? pf?.system_prompt ?? "",
 	);
+	const [tagline, setTagline] = useState(editing?.tagline ?? pf?.tagline ?? "");
 	const [color, setColor] = useState(
 		editing?.color ?? pf?.color ?? COLOR_OPTIONS[0],
 	);
@@ -187,6 +193,11 @@ export function NewContactModal({
 	};
 	const [busy, setBusy] = useState(false);
 	const [err, setErr] = useState<string | null>(null);
+	// Transient success flash (✓) shown briefly before the modal closes — the app
+	// has no toast system, so this matches the existing inline-feedback pattern
+	// (OnboardingModal "已刷新 ✓" / FileTree justRefreshed). Without it, a
+	// successful create closed the modal with ZERO visible feedback.
+	const [okMsg, setOkMsg] = useState<string | null>(null);
 
 	// Load enabled adapters
 	const load = useCallback(async () => {
@@ -287,8 +298,11 @@ export function NewContactModal({
 					name: name.trim(),
 					model: finalModel,
 					system_prompt: systemPrompt.trim(),
+					tagline: tagline.trim(),
 					color,
 					max_context_tokens: parsedMaxCtx,
+					...(apiKey.trim() ? { api_key: apiKey.trim() } : {}),
+					api_base_url: apiBaseUrl.trim() || null,
 					skills: cleanSkills(),
 				});
 			} else {
@@ -297,13 +311,25 @@ export function NewContactModal({
 					name: name.trim(),
 					model: finalModel,
 					system_prompt: systemPrompt.trim() || undefined,
+					tagline: tagline.trim() || undefined,
 					color,
 					max_context_tokens: parsedMaxCtx ?? undefined,
+					api_key: apiKey.trim() || undefined,
+					api_base_url: apiBaseUrl.trim() || undefined,
 					skills: cleanSkills(),
 				});
 			}
 			await onCreated();
-			onClose();
+			// Show a brief ✓ confirmation, then close (keep `busy` so the form
+			// can't be re-submitted during the flash). 1100ms matches FileTree's
+			// transient-feedback revert.
+			setOkMsg(
+				t(isEdit ? "contactSaved" : "contactCreated", lang).replace(
+					"{name}",
+					name.trim(),
+				),
+			);
+			setTimeout(onClose, 1100);
 		} catch (e) {
 			setErr(String(e));
 			setBusy(false);
@@ -476,6 +502,33 @@ export function NewContactModal({
 								</div>
 							</Field>
 
+							<Field label={t("apiKey", lang)}>
+								<input
+									type="password"
+									autoComplete="new-password"
+									value={apiKey}
+									onChange={(e) => setApiKey(e.target.value)}
+									placeholder={isEdit ? "••••••••" : "sk-…"}
+									className="w-full text-[13px] px-3 py-2 rounded border border-[var(--color-line-strong)] bg-[var(--color-bg)] text-[var(--color-fg)] placeholder:text-[var(--color-fg-3)] font-mono outline-none focus:border-[var(--color-accent)]"
+								/>
+								<div className="text-[10.5px] text-[var(--color-fg-3)] leading-relaxed">
+									{t("apiKeyHint", lang)}
+								</div>
+							</Field>
+
+							<Field label={t("apiBaseUrl", lang)}>
+								<input
+									type="url"
+									value={apiBaseUrl}
+									onChange={(e) => setApiBaseUrl(e.target.value)}
+									placeholder="https://api.example.com/v1"
+									className="w-full text-[13px] px-3 py-2 rounded border border-[var(--color-line-strong)] bg-[var(--color-bg)] text-[var(--color-fg)] placeholder:text-[var(--color-fg-3)] font-mono outline-none focus:border-[var(--color-accent)]"
+								/>
+								<div className="text-[10.5px] text-[var(--color-fg-3)] leading-relaxed">
+									{t("apiBaseUrlHint", lang)}
+								</div>
+							</Field>
+
 							<Field label={t("contactName", lang)} required>
 								<input
 									autoFocus
@@ -490,6 +543,16 @@ export function NewContactModal({
 										{t("contactNameConflict", lang)}
 									</div>
 								)}
+							</Field>
+
+							<Field label={t("contactTagline", lang)}>
+								<input
+									type="text"
+									value={tagline}
+									onChange={(e) => setTagline(e.target.value)}
+									placeholder={t("contactTaglineHint", lang)}
+									className="w-full text-[13px] px-3 py-2 rounded border border-[var(--color-line-strong)] bg-[var(--color-bg)] text-[var(--color-fg)] placeholder:text-[var(--color-fg-3)] outline-none focus:border-[var(--color-accent)]"
+								/>
 							</Field>
 
 							<Field label={t("systemPrompt", lang)}>
@@ -690,6 +753,12 @@ export function NewContactModal({
 					{err && (
 						<div className="text-[11.5px] text-[var(--color-red)] bg-[var(--color-red-soft)]/40 px-3 py-2 rounded border border-[var(--color-red)]/30">
 							{err}
+						</div>
+					)}
+
+					{okMsg && (
+						<div className="text-[11.5px] text-[#27AE60] bg-[#27AE60]/10 px-3 py-2 rounded border border-[#27AE60]/30">
+							{okMsg}
 						</div>
 					)}
 				</div>

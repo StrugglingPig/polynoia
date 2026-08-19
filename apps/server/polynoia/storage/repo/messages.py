@@ -4,17 +4,30 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from polynoia.domain.entities import new_ulid
 from polynoia.storage.models import (
+    MESSAGE_ID_MAX_LENGTH,
     ConflictRow,
     ConversationRow,
     MessageRow,
     PendingAccessRow,
     PendingEditRow,
 )
+
+
+class MessageIdConflictError(ValueError):
+    pass
+
+
+def _validate_message_reference(value: str | None, *, field: str) -> None:
+    if value is not None and len(value) > MESSAGE_ID_MAX_LENGTH:
+        raise ValueError(
+            f"{field} must be at most {MESSAGE_ID_MAX_LENGTH} characters"
+        )
+
 
 # ── Message ──────────────────────────────────────────────────────────
 
@@ -38,6 +51,8 @@ async def append_message(
     the payload (every turn part is already ``_stamp_turn``'d), so the indexed
     column auto-populates with no caller churn. Returns the new ID.
     """
+    _validate_message_reference(msg_id, field="msg_id")
+    _validate_message_reference(in_reply_to, field="in_reply_to")
     mid = msg_id or new_ulid()
     if turn_id is None and isinstance(payload, dict):
         tv = payload.get("turn_id")
@@ -62,6 +77,148 @@ async def append_message(
         )
     await session.flush()
     return mid
+
+
+async def append_message_once(
+    session: AsyncSession,
+    *,
+    conv_id: str,
+    sender_id: str,
+    payload: dict[str, Any],
+    msg_id: str | None = None,
+    in_reply_to: str | None = None,
+    code_sha: str | None = None,
+    turn_id: str | None = None,
+) -> tuple[str, bool]:
+    if msg_id == "":
+        raise ValueError("msg_id must not be empty")
+    _validate_message_reference(msg_id, field="msg_id")
+    _validate_message_reference(in_reply_to, field="in_reply_to")
+    if msg_id is not None:
+        existing = await session.get(MessageRow, msg_id)
+        if existing is not None:
+            actual = (
+                existing.conv_id,
+                existing.sender_id,
+                existing.payload,
+                existing.in_reply_to,
+            )
+            expected = (conv_id, sender_id, payload, in_reply_to)
+            if actual != expected:
+                raise MessageIdConflictError(msg_id)
+            return msg_id, False
+    mid = await append_message(
+        session,
+        conv_id=conv_id,
+        sender_id=sender_id,
+        payload=payload,
+        msg_id=msg_id,
+        in_reply_to=in_reply_to,
+        code_sha=code_sha,
+        turn_id=turn_id,
+    )
+    return mid, True
+
+
+# ── Sidebar last-message preview ─────────────────────────────────────
+#
+# The conversation-list endpoint shows a 微信/Slack-style preview of each
+# conv's newest message under the title. We derive a one-line string from the
+# payload here (server-side) so the row stays cheap: only text/reasoning carry
+# real body text; every other card kind returns "" and the frontend localizes a
+# label from ``kind`` (keeps Chinese out of the backend).
+
+_PREVIEW_MAX_CHARS = 140
+
+
+def _inline_to_text(c: Any) -> str:
+    """Flatten a TextBlock.c (str | InlineContent) into plain text."""
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts: list[str] = []
+        for seg in c:
+            if not isinstance(seg, dict):
+                continue
+            if seg.get("type") == "text":
+                parts.append(str(seg.get("text", "")))
+            elif seg.get("type") == "mention":
+                parts.append("@" + str(seg.get("m", "")))
+        return "".join(parts)
+    return ""
+
+
+def _preview_from_payload(payload: Any) -> tuple[str, str]:
+    """One-line sidebar preview for a message payload → ``(text, kind)``.
+
+    text/reasoning → flattened, whitespace-collapsed, truncated body. Every
+    other of the 12 card kinds → ``("", kind)`` so the client can render a
+    localized "[card]"-style label instead.
+    """
+    if not isinstance(payload, dict):
+        return "", ""
+    kind = str(payload.get("kind") or "")
+    if kind in ("text", "reasoning"):
+        body = payload.get("body") or []
+        chunks = [
+            _inline_to_text(blk.get("c")) for blk in body if isinstance(blk, dict)
+        ]
+        text = " ".join(s.strip() for s in chunks if s and s.strip())
+        text = " ".join(text.split())  # collapse runs of whitespace/newlines
+        if len(text) > _PREVIEW_MAX_CHARS:
+            text = text[:_PREVIEW_MAX_CHARS].rstrip() + "…"
+        return text, kind
+    return "", kind
+
+
+async def latest_messages_for_convs(
+    session: AsyncSession, conv_ids: list[str]
+) -> dict[str, MessageRow]:
+    """Newest message per conversation, in ONE query (no N+1 over the list).
+
+    Ties on ``created_at`` are broken by ``id`` desc (ULIDs are monotonic),
+    matching ``list_messages``' newest-first ordering. Convs with no messages
+    are simply absent from the result.
+    """
+    if not conv_ids:
+        return {}
+    newest = (
+        select(
+            MessageRow.conv_id.label("cid"),
+            func.max(MessageRow.created_at).label("mts"),
+        )
+        .where(MessageRow.conv_id.in_(conv_ids))
+        .group_by(MessageRow.conv_id)
+        .subquery()
+    )
+    stmt = (
+        select(MessageRow)
+        .join(
+            newest,
+            (MessageRow.conv_id == newest.c.cid)
+            & (MessageRow.created_at == newest.c.mts),
+        )
+        .order_by(MessageRow.conv_id, MessageRow.id.desc())
+    )
+    rows = (await session.execute(stmt)).scalars().all()
+    out: dict[str, MessageRow] = {}
+    for row in rows:
+        out.setdefault(row.conv_id, row)  # id-desc → first seen is newest on ties
+    return out
+
+
+async def latest_message_previews(
+    session: AsyncSession, conv_ids: list[str]
+) -> dict[str, dict[str, Any]]:
+    """Sidebar preview of each conv's newest message:
+    ``{conv_id: {"text", "sender_id", "kind"}}``. One query; empty convs absent.
+    """
+    rows = await latest_messages_for_convs(session, conv_ids)
+    out: dict[str, dict[str, Any]] = {}
+    for cid, row in rows.items():
+        text, kind = _preview_from_payload(row.payload)
+        out[cid] = {"text": text, "sender_id": row.sender_id, "kind": kind}
+    return out
 
 
 async def delete_messages_from(
@@ -148,15 +305,24 @@ async def upsert_message(
     msg_id: str,
     in_reply_to: str | None = None,
 ) -> str:
-    """Insert a message, or overwrite its payload if a row with ``msg_id``
-    already exists. Lets a tool-call/diff part persist incrementally (the moment
-    it completes, so a mid-stream refresh keeps the trace) AND be re-written at
-    turn-end with its final state — same stable id, no duplicate row. Also makes
-    the optimistic-id write path idempotent: a client retry/double-send of the
-    same pre-allocated id updates in place instead of colliding on the PK. Caller
-    commits."""
+    """Insert a message, or update a mutable part owned by the same identity.
+
+    Tool-call/diff parts persist incrementally and are rewritten at turn-end
+    under one stable id. An existing global id may never be adopted by another
+    conversation, sender, or reply thread; ordinary client replay uses
+    ``append_message_once`` and its stricter exact-payload comparison instead.
+    Caller commits.
+    """
+    _validate_message_reference(msg_id, field="msg_id")
+    _validate_message_reference(in_reply_to, field="in_reply_to")
     row = await session.get(MessageRow, msg_id)
     if row is not None:
+        if (
+            row.conv_id != conv_id
+            or row.sender_id != sender_id
+            or row.in_reply_to != in_reply_to
+        ):
+            raise MessageIdConflictError(msg_id)
         row.payload = payload
         await session.flush()
         return msg_id

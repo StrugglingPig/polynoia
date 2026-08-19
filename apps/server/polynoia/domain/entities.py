@@ -8,7 +8,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_serializer
 from ulid import ULID as _ULID
 
 ULID = str  # 形如 "01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -52,6 +52,11 @@ class AgentSetup(BaseModel):
     docs: str | None = None
     adapter_id: str | None = None  # claudeCode / codex / opencoder
     model: str | None = None  # backend model id, e.g. "claude-sonnet-4"
+    # A contact's credential is deliberately excluded from every API model
+    # serialization.  The storage repository persists it explicitly; callers
+    # can replace it, but can never read it back through a contact response.
+    api_key: str | None = Field(default=None, exclude=True)
+    api_base_url: str | None = None
     # User-specified model context-window ceiling, in tokens. The contact modal
     # requires picking a preset (128k / 200k / 256k / 1M / custom) — there is no
     # model→context guessing table (it mis-guessed third-party / proxy models).
@@ -62,9 +67,11 @@ class AgentSetup(BaseModel):
 
 
 class AgentSkill(BaseModel):
-    """A reusable capability/prompt preset bound to a contact (agent). Its
-    ``instructions`` are injected into the agent's identity layer (system
-    prompt) at turn time, so "attaching a skill" gives the agent that ability."""
+    """A reusable Skill package bound to a contact (agent).
+
+    Native-capable adapters receive the complete package and load it on demand.
+    ``instructions`` is an optional per-contact inline override/fallback.
+    """
 
     name: str
     instructions: str
@@ -172,6 +179,18 @@ class Conversation(BaseModel):
     # Auto:   orchestrator merges agent branches into main automatically
     #         after all sub-tasks finish.
     merge_mode: Literal["auto", "manual"] = "auto"
+
+    @field_serializer("created_at", "updated_at", "last_message_at", when_used="json")
+    def _ser_utc(self, v: datetime | None) -> str | None:
+        # created_at/updated_at/last_message_at are naive UTC (datetime.utcnow()).
+        # Pydantic serializes a naive datetime WITHOUT a tz marker, so the client's
+        # `new Date(...)` reads it as LOCAL and the sidebar time shows 8h off in
+        # +08:00 (the「消息时间和时区不对应」bug). Emit an explicit trailing "Z" so
+        # it's unambiguously UTC. (Message rows already do this in their dict
+        # serializer; this aligns the Conversation contract.)
+        if v is None:
+            return None
+        return v.isoformat() + "Z" if v.tzinfo is None else v.isoformat()
 
 
 # ── Pin(长期上下文) ──────────────────────────────────────────
