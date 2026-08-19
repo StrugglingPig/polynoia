@@ -25,6 +25,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git merge upstream/master
-          git push https://x-access-token:$GITHUB_TOKEN@github.com/StrugglingPig/polynoia.git HEAD:master --force-with-lease
+          git merge upstream/main
+          git push https://x-access-token:$GITHUB_TOKEN@github.com/StrugglingPig/polynoia.git HEAD:main --force-with-lease
 
